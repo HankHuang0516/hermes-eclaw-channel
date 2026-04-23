@@ -31,6 +31,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import subprocess
 from typing import Any
 
@@ -94,20 +95,32 @@ async def speak_to(session: ClientSession, to_entity_id: int, text: str, expects
 
 # --- Hermes invocation ---------------------------------------------------
 
-def _strip_eclaw_context(text: str) -> str:
-    """Remove EClaw's auto-appended [Local Variables available: ...] block.
+# NOTE on regex: the quota line can embed nested brackets (`"[SILENT]"`),
+# so we can't rely on the outer `]` to close — just consume to end-of-line.
+_QUOTA_LINE_RE = re.compile(r"^\[Quota:.*$", re.MULTILINE)
 
-    EClaw injects available env vars / skills into every message. Our bridge
-    already inherits the env, so this is noise for Hermes.
+
+def _strip_eclaw_context(text: str) -> str:
+    """Strip EClaw's auto-injected context blocks that pollute the prompt.
+
+    EClaw's server prepends/appends several things that are either redundant
+    or actively harmful for Hermes:
+
+      - ``[Local Variables available: ...]`` / ``[AVAILABLE TOOLS ...]`` —
+        meant for OpenClaw bots; noise for us.
+      - ``[Quota: N/M bot-to-bot remaining — output "[SILENT]" if
+        nothing worth replying]`` — the instruction Hermes is way too
+        willing to comply with, causing false silent skips.
     """
     for marker in ("\n[Local Variables available:", "\n[AVAILABLE TOOLS"):
         idx = text.find(marker)
         if idx >= 0:
             text = text[:idx]
+    text = _QUOTA_LINE_RE.sub("", text)
     return text.strip()
 
 
-HERMES_TIMEOUT = int(os.environ.get("HERMES_TIMEOUT_SECS", "90"))
+HERMES_TIMEOUT = int(os.environ.get("HERMES_TIMEOUT_SECS", "300"))
 
 # Serialise Hermes calls — each spawn writes to ~/.hermes/sessions and
 # concurrent hermes CLI processes can corrupt session state.
