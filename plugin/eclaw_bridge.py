@@ -53,7 +53,9 @@ API_BASE = os.environ.get("HERMES_ECLAW_API_BASE", "https://eclawbot.com")
 CALLBACK_TOKEN = os.environ["HERMES_ECLAW_CALLBACK_TOKEN"]
 PORT = int(os.environ.get("HERMES_PORT", "8644"))
 
-SILENT_TOKEN = "[SILENT]"  # EClaw convention: bot outputs this to skip reply
+# Kept as a safety net — if Hermes still happens to output this exact token
+# (e.g. from system prompt or memory), skip the reply.
+SILENT_TOKEN = "[SILENT]"
 
 
 # --- EClaw API ------------------------------------------------------------
@@ -199,16 +201,18 @@ async def process_message(msg: dict) -> None:
         log.info("ignore message for entity %s (we are %d)", entity_id, ENTITY_ID)
         return
 
-    # Build prompt — enrich bot-to-bot with source context, like openclaw does
+    # Build prompt — enrich bot-to-bot/broadcast with sender context so Hermes
+    # knows who's talking. We intentionally do NOT inject EClaw's
+    # "output [SILENT] if nothing worth replying" quota instruction: Hermes
+    # is too willing to comply and nearly every broadcast came back silent,
+    # which looked like the bridge was stuck. Reply on every inbound; if
+    # noise becomes an issue, filter at the sender side.
     prompt = text
     if event in ("entity_message", "broadcast") and from_entity_id is not None:
         sender = f"Entity {from_entity_id}" + (f" ({from_character})" if from_character else "")
         prefix = "Broadcast from" if event == "broadcast" else "Bot-to-Bot from"
         hints = eclaw_ctx.get("missionHints", "")
-        quota = ""
-        if eclaw_ctx.get("b2bRemaining") is not None:
-            quota = f"[Quota: {eclaw_ctx['b2bRemaining']}/{eclaw_ctx.get('b2bMax', 8)} — output \"{SILENT_TOKEN}\" if nothing worth replying]"
-        prompt = "\n".join(x for x in [f"[{prefix} {sender}]", quota, hints, text] if x)
+        prompt = "\n".join(x for x in [f"[{prefix} {sender}]", hints, text] if x)
 
     log.info("event=%s from=%s text=%r", event, from_entity_id or "user", text[:80])
     reply = await ask_hermes(prompt)
