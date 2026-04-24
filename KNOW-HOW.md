@@ -210,6 +210,51 @@ except asyncio.TimeoutError:
 
 ---
 
+## 15a. bot-to-bot / broadcast 本體訊息被 strip 掉（prompt_len ≈ 36 / Hermes 回「沒有附帶任何內容」）
+
+**症狀**：從其他 entity 用 `/api/entity/speak-to` 或 `/api/transform speakTo:[...]` 送訊息給 Hermes，Hermes 回覆「收到空白訊息」。bridge log 顯示：
+
+```
+event=entity_message from=2 text='[Bot-to-Bot message from Entity 2 (LOBSTER)]\n[Quota: ...'
+[hermes] spawning chat, prompt_len=36    ← 只剩 bridge 自己 prepend 的 header，body 全沒
+```
+
+**根因（自家 bridge 的 bug，不是 Hermes）**：
+
+`process_message` 組 prompt 時把 `missionHints`（內容是 `[AVAILABLE TOOLS — Mission Dashboard]...`）插在 `text` 前面：
+
+```python
+# ❌ 壞的寫法
+hints = eclaw_ctx.get("missionHints", "")
+prompt = "\n".join([f"[{prefix} {sender}]", hints, text])
+```
+
+然後 `ask_hermes` 呼 `_strip_eclaw_context(prompt)`，marker `\n[AVAILABLE TOOLS` 在 prompt 的**最前面**（就在 bridge header 之後）就命中了，把**後面整個 body 一起截掉**。
+
+關鍵點：EClaw server 的 `materializeChannelText` **已經**把 missionHints 嵌在 `text` 尾端了。bridge 再從 `eclaw_context.missionHints` 讀一次、塞到 body 前面，就等於把 strip marker 往前搬、把 body 炸掉。
+
+**修法**：不要再從 `eclaw_context` 讀 missionHints — text 已經包了。
+
+```python
+# ✅ 正確寫法
+prompt = f"[{prefix} {sender}]\n{text}" if text else f"[{prefix} {sender}]"
+```
+
+這樣 `_strip_eclaw_context` 還是會正確截掉 text 尾端的 `[Local Variables]` / `[AVAILABLE TOOLS]` block，但 body 會完整保留。
+
+**診斷方法（以後碰到 silent-body 問題先跑這個）**：
+
+```python
+# 暫時在 process_message 加：
+log.info("raw_text_len=%d head400=%r tail=%r", len(text), text[:400], text[-200:])
+```
+
+比對 `raw_text_len` 和最終 `prompt_len`：
+- 若 raw 很大 / prompt_len 只剩 ~36 → 本 bug（strip 吃掉 body）。
+- 若 raw 就接近 envelope 大小 → EClaw server 那邊沒把 body 傳過來，查 backend 的 `unifiedPush` / `channelPayload.text` 覆寫邏輯（`enrichedMessage !== payload.message` 條件）。
+
+---
+
 ## 15. Hermes gateway `deliver: log` 只寫 log，不會自動回 reply 給 EClaw
 
 Built-in `deliver` 選項只有 `telegram / discord / slack / github_comment / log`，**沒有「POST 回 source webhook」**。

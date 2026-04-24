@@ -222,10 +222,15 @@ async def process_message(msg: dict) -> None:
     # noise becomes an issue, filter at the sender side.
     prompt = text
     if event in ("entity_message", "broadcast") and from_entity_id is not None:
+        # Do NOT prepend missionHints: the server already embeds them inside
+        # `text` (via materializeChannelText). Prepending again put
+        # `[AVAILABLE TOOLS ...]` ahead of the body, and _strip_eclaw_context's
+        # `\n[AVAILABLE TOOLS` truncation then wiped both hints and the body —
+        # the bridge forwarded only the bridge's own header (prompt_len≈36),
+        # and Hermes replied "Bot-to-Bot 訊息但似乎沒有附帶任何內容".
         sender = f"Entity {from_entity_id}" + (f" ({from_character})" if from_character else "")
         prefix = "Broadcast from" if event == "broadcast" else "Bot-to-Bot from"
-        hints = eclaw_ctx.get("missionHints", "")
-        prompt = "\n".join(x for x in [f"[{prefix} {sender}]", hints, text] if x)
+        prompt = f"[{prefix} {sender}]\n{text}" if text else f"[{prefix} {sender}]"
 
     log.info("event=%s from=%s text=%r", event, from_entity_id or "user", text[:80])
     reply = await ask_hermes(prompt)
