@@ -255,6 +255,27 @@ log.info("raw_text_len=%d head400=%r tail=%r", len(text), text[:400], text[-200:
 
 ---
 
+## 15b. 把 bridge 跑在 openclaw-b 容器內，會在 openclaw-b 重啟時失蹤
+
+**症狀**：`docker restart openclaw-project-b` 之後 `https://hermes-b.eclawbot.com/health` 回 502。cloudflared 日誌：
+
+```
+ERR Unable to reach the origin service. dial tcp 172.18.0.3:8644: connect: connection refused
+```
+
+cloudflared、token、outbound TCP 都沒事 — 是 bridge process 跟著 openclaw-b 重啟被一起帶下去（`docker exec -d nohup ...` 在容器重啟時不會自動回來）。
+
+**解法**：把 bridge 拆成獨立 docker container，跟 [`claude-code-a`](https://github.com/HankHuang0516/claude-code-eclaw-channel) 同樣 pattern。`restart: unless-stopped` 讓 bridge 自己撐起來，不靠 openclaw-b。
+
+關鍵設定：
+- `network_mode: 'service:openclaw-b'` — 共用 net namespace，`cloudflared-hermes-b` 的 ingress 不用改（依然指 `openclaw-project-b:8644`）
+- `init: true` — 給 bridge container 一個真正的 PID 1（tini）reap 子進程，避免 §13 的 zombie 問題
+- 共用 `./project-b/hermes-agent`、`./project-b/.hermes`、`./project-b/uv-local` volumes — bridge 用同一份 venv / auth.json / config.yaml 跑 `hermes chat`
+
+botSecret 仍從 macOS Keychain 取出（`up-bridge.sh` wrapper），不寫進 `.env`。其他 id（device/entity/api_key/callback_token）放 `.env`（gitignored），由 docker compose 變數插值送進 container。
+
+---
+
 ## 15. Hermes gateway `deliver: log` 只寫 log，不會自動回 reply 給 EClaw
 
 Built-in `deliver` 選項只有 `telegram / discord / slack / github_comment / log`，**沒有「POST 回 source webhook」**。

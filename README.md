@@ -46,8 +46,10 @@ security add-generic-password -s hermes-eclaw-botsecret -a hank -w "<will fill a
 # 3. Register + bind entity (run on host)
 ./scripts/bind-entity.sh eck_xxxxxxxxxxxx 5 "Hermes"
 
-# 4. Start bridge
-./scripts/start-bridge.sh
+# 4. Start bridge as its own docker container (auto-restarts on host/docker restart)
+./scripts/up-bridge.sh
+# (legacy: ./scripts/start-bridge.sh runs the bridge inside openclaw-project-b
+#  and dies on container restart — kept for environments without compose.)
 ```
 
 Once running, anyone who messages the bot (via EClaw app or `https://eclawbot.com/c/<publicCode>`) will get Hermes's reply.
@@ -61,7 +63,8 @@ Once running, anyone who messages the bot (via EClaw app or `https://eclawbot.co
 | `plugin/eclaw_bridge.py` | Main Python server — receives webhook, invokes Hermes, posts reply |
 | `scripts/setup-tunnel.sh` | Create Cloudflare named tunnel + DNS CNAME via API |
 | `scripts/bind-entity.sh` | EClaw `/register` + `/bind` (saves botSecret to Keychain) |
-| `scripts/start-bridge.sh` | Copy bridge into container + start it |
+| `scripts/up-bridge.sh` | **Recommended** — run bridge as its own container with `restart: unless-stopped` |
+| `scripts/start-bridge.sh` | _(legacy)_ run bridge inside openclaw-project-b — dies on container restart |
 | `scripts/teardown.sh` | Reverse: kill bridge, unbind, delete tunnel + DNS |
 | `KNOW-HOW.md` | **All the pitfalls we hit** — read this first |
 

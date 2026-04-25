@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# DEPRECATED — prefer ./up-bridge.sh which runs the bridge as its own
+# docker container with restart=unless-stopped. This script is kept only
+# for environments where you can't (or don't want to) add the
+# hermes-bridge service to docker-compose.yml.
+#
 # Start Hermes × EClaw bridge inside openclaw-project-b.
 # Pre-requisites:
 #   - cloudflared-hermes-b running (tunnel live)
