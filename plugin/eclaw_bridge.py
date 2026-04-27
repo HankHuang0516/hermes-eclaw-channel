@@ -120,7 +120,11 @@ def _strip_eclaw_context(text: str) -> str:
     return text.strip()
 
 
-HERMES_TIMEOUT = int(os.environ.get("HERMES_TIMEOUT_SECS", "300"))
+HERMES_TIMEOUT = int(os.environ.get("HERMES_TIMEOUT_SECS", "900"))
+
+# Strip ANSI escape sequences (color, cursor, etc.) so verbose hermes
+# output is readable when piped back to EClaw chat.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07")
 
 # Serialise Hermes calls — each spawn writes to ~/.hermes/sessions and
 # concurrent hermes CLI processes can corrupt session state.
@@ -142,9 +146,12 @@ async def ask_hermes(prompt: str) -> str:
 
     # --continue reuses the most recent session → agent retains conversation
     # memory across calls even though each spawn is a fresh process.
+    # -Q (quiet) deliberately omitted so tool-call previews and streaming
+    # deltas land in stdout, giving the bridge progress signal it can
+    # mid-task forward (also feeds ANSI-stripped output to EClaw chat).
     args = [
         "/home/node/hermes-agent/.venv/bin/hermes",  # skip `uv run` overhead
-        "chat", "-Q", "-q", clean, "--continue",
+        "chat", "-q", clean, "--continue",
     ]
 
     async with _hermes_lock:  # serialize to protect session files
@@ -175,7 +182,8 @@ async def ask_hermes(prompt: str) -> str:
         log.error("[hermes] exit %d: %s", proc.returncode, stderr.decode()[:500])
         return "[Hermes 回覆失敗 — 請查 log]"
 
-    lines = [ln for ln in stdout.decode().splitlines() if not ln.startswith("session_id:")]
+    raw = _ANSI_RE.sub("", stdout.decode())
+    lines = [ln for ln in raw.splitlines() if not ln.startswith("session_id:")]
     reply = "\n".join(lines).strip()
     log.info("[hermes] reply_len=%d", len(reply))
     return reply
