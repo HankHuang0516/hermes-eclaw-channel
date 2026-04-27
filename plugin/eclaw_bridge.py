@@ -33,6 +33,7 @@ import logging
 import os
 import re
 import subprocess
+import textwrap
 from typing import Any
 
 from aiohttp import ClientSession, web
@@ -120,7 +121,45 @@ def _strip_eclaw_context(text: str) -> str:
     return text.strip()
 
 
-HERMES_TIMEOUT = int(os.environ.get("HERMES_TIMEOUT_SECS", "300"))
+HERMES_TIMEOUT = int(os.environ.get("HERMES_TIMEOUT_SECS", "900"))
+
+# Strip ANSI escape sequences (color, cursor, etc.) so verbose hermes
+# output is readable when piped back to EClaw chat.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07")
+
+# Markers used by the verbose hermes CLI to bracket the agent's reply.
+# Top: ` ─  ⚕ Hermes  ─...─ `
+# Tail: `Resume this session with:` or `Session:` summary block
+_HERMES_HEAD_RE = re.compile(r"^\s*─+\s*⚕\s*Hermes\s*─+", re.MULTILINE)
+_HERMES_TAIL_RE = re.compile(r"^(?:Resume this session with:|Session:\s+|Duration:\s+|Messages:\s+)", re.MULTILINE)
+_PURE_RULE_RE = re.compile(r"^[\s─━│╭╮╰╯═]+$")
+
+
+def _extract_hermes_reply(stdout: str) -> str:
+    """Pull the agent's response out of the verbose CLI envelope.
+
+    Without -Q, hermes prints a banner box, query echo, the response inside
+    an `⚕ Hermes` box, and a session-summary footer. We want only the
+    response body.
+    """
+    head = list(_HERMES_HEAD_RE.finditer(stdout))
+    if head:
+        # Use the LAST head — multi-turn output has multiple boxes.
+        body_start = head[-1].end()
+        tail = _HERMES_TAIL_RE.search(stdout, body_start)
+        body = stdout[body_start:tail.start()] if tail else stdout[body_start:]
+    else:
+        body = stdout
+
+    cleaned = []
+    for ln in body.splitlines():
+        if ln.startswith("session_id:"):
+            continue
+        if _PURE_RULE_RE.match(ln):
+            continue
+        cleaned.append(ln.rstrip())
+    text = textwrap.dedent("\n".join(cleaned)).strip()
+    return re.sub(r"\n{3,}", "\n\n", text)
 
 # Serialise Hermes calls — each spawn writes to ~/.hermes/sessions and
 # concurrent hermes CLI processes can corrupt session state.
@@ -142,9 +181,12 @@ async def ask_hermes(prompt: str) -> str:
 
     # --continue reuses the most recent session → agent retains conversation
     # memory across calls even though each spawn is a fresh process.
+    # -Q (quiet) deliberately omitted so tool-call previews and streaming
+    # deltas land in stdout, giving the bridge progress signal it can
+    # mid-task forward (also feeds ANSI-stripped output to EClaw chat).
     args = [
         "/home/node/hermes-agent/.venv/bin/hermes",  # skip `uv run` overhead
-        "chat", "-Q", "-q", clean, "--continue",
+        "chat", "-q", clean, "--continue",
     ]
 
     async with _hermes_lock:  # serialize to protect session files
@@ -175,8 +217,8 @@ async def ask_hermes(prompt: str) -> str:
         log.error("[hermes] exit %d: %s", proc.returncode, stderr.decode()[:500])
         return "[Hermes 回覆失敗 — 請查 log]"
 
-    lines = [ln for ln in stdout.decode().splitlines() if not ln.startswith("session_id:")]
-    reply = "\n".join(lines).strip()
+    raw = _ANSI_RE.sub("", stdout.decode())
+    reply = _extract_hermes_reply(raw)
     log.info("[hermes] reply_len=%d", len(reply))
     return reply
 
