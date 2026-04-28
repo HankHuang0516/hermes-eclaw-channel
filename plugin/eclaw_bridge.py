@@ -34,9 +34,10 @@ import os
 import re
 import subprocess
 import textwrap
+import uuid
 from typing import Any
 
-from aiohttp import ClientSession, web
+from aiohttp import ClientConnectorError, ClientSession, ClientTimeout, web
 
 logging.basicConfig(
     level=logging.INFO,
@@ -54,6 +55,12 @@ BOT_SECRET = os.environ["HERMES_ECLAW_BOT_SECRET"]
 API_BASE = os.environ.get("HERMES_ECLAW_API_BASE", "https://eclawbot.com")
 CALLBACK_TOKEN = os.environ["HERMES_ECLAW_CALLBACK_TOKEN"]
 PORT = int(os.environ.get("HERMES_PORT", "8644"))
+
+# Optional: route Hermes calls through the long-lived HTTP daemon (option B).
+# When unset, the bridge keeps spawning hermes subprocesses as before.
+DAEMON_URL = os.environ.get("HERMES_DAEMON_URL", "").rstrip("/")
+DAEMON_TOKEN = os.environ.get("HERMES_DAEMON_TOKEN", "")
+DAEMON_CONNECT_TIMEOUT = float(os.environ.get("HERMES_DAEMON_CONNECT_TIMEOUT", "5"))
 
 # Kept as a safety net — if Hermes still happens to output this exact token
 # (e.g. from system prompt or memory), skip the reply.
@@ -166,15 +173,81 @@ def _extract_hermes_reply(stdout: str) -> str:
 _hermes_lock = asyncio.Lock()
 
 
+class _DaemonUnavailable(Exception):
+    """Daemon couldn't be reached — caller should fall back to subprocess."""
+
+
+async def _ask_hermes_via_daemon(prompt: str) -> str:
+    """POST /chat to the daemon (JSON mode for now — bridge buffers anyway).
+
+    Connection-level failures raise _DaemonUnavailable so the caller falls back
+    to subprocess. Clean daemon errors (timeout / hermes_exit) become user-facing
+    text; we don't retry in subprocess for those.
+    """
+    url = f"{DAEMON_URL}/chat"
+    headers = {"Accept": "application/json"}
+    if DAEMON_TOKEN:
+        headers["Authorization"] = f"Bearer {DAEMON_TOKEN}"
+    payload = {
+        "prompt": _strip_eclaw_context(prompt),
+        "request_id": str(uuid.uuid4()),
+    }
+
+    timeout = ClientTimeout(connect=DAEMON_CONNECT_TIMEOUT, total=None)
+    try:
+        async with ClientSession(timeout=timeout) as s:
+            async with s.post(url, json=payload, headers=headers) as r:
+                if r.status in (502, 503):
+                    detail = await r.text()
+                    log.warning("[hermes] daemon transport error %d: %s", r.status, detail[:200])
+                    raise _DaemonUnavailable(f"http {r.status}")
+                data = await r.json()
+    except ClientConnectorError as e:
+        log.warning("[hermes] daemon connect failed: %s", e)
+        raise _DaemonUnavailable(str(e)) from e
+    except asyncio.TimeoutError as e:
+        log.warning("[hermes] daemon connect timeout")
+        raise _DaemonUnavailable("connect timeout") from e
+
+    if not data.get("ok"):
+        err = data.get("error", {})
+        kind = err.get("kind", "unknown")
+        if kind == "timeout":
+            return "[Hermes 回應超時]"
+        if kind == "hermes_exit":
+            return "[Hermes 回覆失敗 — 請查 log]"
+        # spawn_failed / busy: degrade to subprocess
+        log.warning("[hermes] daemon error %s, falling back: %s", kind, err.get("detail"))
+        raise _DaemonUnavailable(kind)
+
+    if data.get("silent"):
+        return SILENT_TOKEN  # process_message() already handles this
+    return data.get("reply", "")
+
+
 async def ask_hermes(prompt: str) -> str:
+    """Dispatch to daemon if configured, else legacy subprocess.
+
+    Daemon disabled by default; set HERMES_DAEMON_URL to opt in. Connection-level
+    failures fall back to subprocess so a daemon outage degrades gracefully.
+    """
+    if DAEMON_URL:
+        try:
+            return await _ask_hermes_via_daemon(prompt)
+        except _DaemonUnavailable:
+            log.warning("[hermes] daemon unreachable, falling back to subprocess")
+    return await _ask_hermes_subprocess(prompt)
+
+
+async def _ask_hermes_subprocess(prompt: str) -> str:
     """
     呼叫 Hermes CLI，回 stdout（quiet mode：只剩最終回覆）。
 
     加 timeout 保護：容器裡 PID 1 不 reap child，subprocess 若異常退出
-    可能變 zombie 導致 communicate() 永遠不返回。timeout 90s 兜底。
+    可能變 zombie 導致 communicate() 永遠不返回。timeout 兜底。
 
-    TODO(cost): 每次 spawn 新 process，冷啟動慢。production 應改呼 Hermes HTTP API
-    或常駐 Python worker。
+    Legacy path. Used directly when HERMES_DAEMON_URL is unset, and as a
+    fallback when the daemon is unreachable.
     """
     clean = _strip_eclaw_context(prompt)
     log.info("[hermes] spawning chat, prompt_len=%d", len(clean))
