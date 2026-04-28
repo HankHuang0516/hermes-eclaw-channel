@@ -95,6 +95,7 @@ async def _chat_json(req: web.Request, body: dict) -> web.Response:
     try:
         result = await _run_and_collect(body["prompt"], request_id)
     except hermes_worker.HermesError as e:
+        log.warning("[hermes] %s rid=%s: %s", e.kind, request_id[:8], e.detail[:500])
         status = {"timeout": 504, "spawn_failed": 503, "hermes_exit": 502}.get(e.kind, 500)
         return _err(e.kind, e.detail, status)
     return web.json_response({
@@ -126,6 +127,7 @@ async def _chat_sse(req: web.Request, body: dict) -> web.StreamResponse:
     try:
         result = await _run_and_collect(body["prompt"], request_id)
     except hermes_worker.HermesError as e:
+        log.warning("[hermes] %s rid=%s: %s", e.kind, request_id[:8], e.detail[:500])
         await emit("error", {"request_id": request_id, "kind": e.kind, "detail": e.detail})
         await resp.write_eof()
         return resp
