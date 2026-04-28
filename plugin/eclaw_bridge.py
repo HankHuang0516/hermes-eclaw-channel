@@ -62,6 +62,15 @@ DAEMON_URL = os.environ.get("HERMES_DAEMON_URL", "").rstrip("/")
 DAEMON_TOKEN = os.environ.get("HERMES_DAEMON_TOKEN", "")
 DAEMON_CONNECT_TIMEOUT = float(os.environ.get("HERMES_DAEMON_CONNECT_TIMEOUT", "5"))
 
+# Drop webhook deliveries timestamped older than this many seconds. EClaw
+# retries failed webhooks; on bridge restart, the in-flight backlog can land
+# all at once, all stale. Replaying them just re-triggers whatever wedged us
+# (NousResearch issue #7536 stuck-session-on-restart loop). Default 5min;
+# bump if your latency budget exceeds that.
+STALE_WEBHOOK_THRESHOLD_S = int(os.environ.get("HERMES_STALE_WEBHOOK_THRESHOLD_S", "300"))
+import time as _time
+_BOOT_TS = _time.time()
+
 # Kept as a safety net — if Hermes still happens to output this exact token
 # (e.g. from system prompt or memory), skip the reply.
 SILENT_TOKEN = "[SILENT]"
@@ -310,6 +319,24 @@ async def handle_webhook(request: web.Request) -> web.Response:
         body = await request.json()
     except Exception as e:
         return web.json_response({"error": f"bad body: {e}"}, status=400)
+
+    # Drop stale webhook deliveries — EClaw retries failed webhooks, and on
+    # bridge restart the backlog can all land at once and re-trigger the
+    # exact problem we just restarted to escape (NousResearch issue #7536).
+    # We compare msg.timestamp (Date.now() from EClaw) against the bridge's
+    # boot wall time + a wall-time threshold; messages from before the
+    # bridge booted (or older than threshold) get a 200 OK + log + drop.
+    msg_ts_ms = body.get("timestamp")
+    if isinstance(msg_ts_ms, (int, float)):
+        msg_age_s = _time.time() - (msg_ts_ms / 1000)
+        if msg_age_s > STALE_WEBHOOK_THRESHOLD_S:
+            log.warning(
+                "[stale-drop] webhook age %.1fs > %ds threshold; ignoring "
+                "msg from entity %s (event=%s)",
+                msg_age_s, STALE_WEBHOOK_THRESHOLD_S,
+                body.get("fromEntityId") or "user", body.get("event"),
+            )
+            return web.json_response({"ok": True, "dropped": "stale"})
 
     # ACK immediately so EClaw doesn't time out; process in background.
     asyncio.create_task(process_message(body))
