@@ -54,6 +54,8 @@ _HERMES_HEAD_RE = re.compile(r"^\s*─+\s*⚕\s*Hermes\s*─+", re.MULTILINE)
 _HERMES_TAIL_RE = re.compile(r"^(?:Resume this session with:|Session:\s+|Duration:\s+|Messages:\s+)", re.MULTILINE)
 _PURE_RULE_RE = re.compile(r"^[\s─━│╭╮╰╯═]+$")
 
+_RICH_OPEN_BRACKET_RE = re.compile(r"\[")
+
 
 def strip_eclaw_context(text: str) -> str:
     """Drop EClaw's auto-injected context blocks before passing to Hermes.
@@ -67,6 +69,26 @@ def strip_eclaw_context(text: str) -> str:
             text = text[:idx]
     text = _QUOTA_LINE_RE.sub("", text)
     return text.strip()
+
+
+def escape_rich_brackets(text: str) -> str:
+    """Escape ``[`` so hermes CLI's rich.console banner doesn't crash.
+
+    hermes-agent ``cli.py`` runs ``console.print(f"[bold blue]Query:[/] {q}")``
+    on every chat invocation. Rich treats ``[anything]`` as markup tags; an
+    EClaw kanban notification like ``[D/P2][i18n] task title`` parses as a
+    malformed tag and raises ``MarkupError`` → ``rc=1`` before the LLM is
+    ever called. We saw this crash 14× on 2026-04-28 alone, every kanban
+    nudge to Hermes silently failing.
+
+    Doubling ``[`` to ``\\[`` is rich's documented escape: the display banner
+    renders ``[`` literally, and the LLM receives the prompt with literal
+    ``\\[`` characters. LLMs treat ``\\[D/P2\\]`` as semantically equivalent
+    to ``[D/P2]`` (just an escape-sequence form of the same content), so the
+    label remains intelligible — and the alternative was a 100% delivery
+    failure for any prompt with brackets in it.
+    """
+    return _RICH_OPEN_BRACKET_RE.sub(r"\\[", text)
 
 
 def extract_hermes_reply(stdout: str) -> str:
@@ -175,12 +197,13 @@ async def run_chat(prompt: str, timeout: Optional[int] = None) -> HermesResult:
     """
     global _call_count, _resume_auto_disabled
     clean = strip_eclaw_context(prompt)
+    safe = escape_rich_brackets(clean)
     wall_deadline = timeout if timeout is not None else DEFAULT_TIMEOUT
     use_continue = not (HERMES_NO_RESUME or _resume_auto_disabled)
     is_first_call = _call_count == 0
     _call_count += 1
 
-    args = [HERMES_BIN, "chat", "-q", clean]
+    args = [HERMES_BIN, "chat", "-q", safe]
     if use_continue:
         args.append("--continue")
 
@@ -256,7 +279,10 @@ async def run_chat(prompt: str, timeout: Optional[int] = None) -> HermesResult:
     stderr_bytes = b"".join(stderr_chunks)
 
     if proc.returncode != 0:
-        raise HermesError("hermes_exit", f"rc={proc.returncode}: {stderr_bytes.decode(errors='replace')[:500]}")
+        # 4000-char cap: enough for full Python traceback (the rich.MarkupError
+        # crash that caused this very file to exist had its key frame at byte
+        # ~700, beyond the previous 500-char limit — silent diagnosis loss).
+        raise HermesError("hermes_exit", f"rc={proc.returncode}: {stderr_bytes.decode(errors='replace')[:4000]}")
 
     raw = _ANSI_RE.sub("", stdout_bytes.decode(errors="replace"))
     reply = extract_hermes_reply(raw)

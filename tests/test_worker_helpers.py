@@ -39,6 +39,17 @@ FIXTURES = [
 ]
 
 
+BRACKET_FIXTURES = [
+    "",
+    "no brackets here",
+    "[D/P2][i18n] kanban search-scope keys (ja/ko/de)",
+    "⏰ 任務催促：[Feature archive: vector-search] 已停滯 8.4h",
+    "🚫 卡片「[E2E-found] Info page hero 區塊在 11 locales 退回英文」",
+    "nested ] without open is fine",
+    "[bold]fake markup[/bold] should escape too",
+]
+
+
 @pytest.mark.parametrize("text", FIXTURES)
 def test_strip_parity(text: str) -> None:
     assert w.strip_eclaw_context(text) == b._strip_eclaw_context(text)
@@ -47,6 +58,24 @@ def test_strip_parity(text: str) -> None:
 @pytest.mark.parametrize("text", FIXTURES)
 def test_extract_parity(text: str) -> None:
     assert w.extract_hermes_reply(text) == b._extract_hermes_reply(text)
+
+
+@pytest.mark.parametrize("text", BRACKET_FIXTURES)
+def test_escape_brackets_parity(text: str) -> None:
+    """Daemon and bridge must escape identically — divergence = silent split brain."""
+    assert w.escape_rich_brackets(text) == b._escape_rich_brackets(text)
+
+
+def test_escape_brackets_doubles_open() -> None:
+    """`[` → `\\[` (rich's documented escape for literal display)."""
+    assert w.escape_rich_brackets("[D/P2]") == r"\[D/P2]"
+    assert w.escape_rich_brackets("[a][b][c]") == r"\[a]\[b]\[c]"
+
+
+def test_escape_brackets_no_change_when_no_open() -> None:
+    """Pure text and ``]``-only input pass through untouched."""
+    assert w.escape_rich_brackets("hello world") == "hello world"
+    assert w.escape_rich_brackets("trailing ] only") == "trailing ] only"
 
 
 def test_silent_token_constant() -> None:
