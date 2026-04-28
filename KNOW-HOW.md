@@ -172,6 +172,8 @@ def _strip_eclaw_context(text: str) -> str:
 
 ## 13. Docker 容器 PID 1 常常不是 init → subprocess 變 zombie 會拖住 asyncio
 
+> **2026-04-28 update — daemon 切換後大幅減弱**：bridge 不再 per-message spawn `hermes chat` (除非 daemon fallback)。daemon 自己只 spawn **一個** persistent `hermes --continue` child，掛掉時由 daemon 統一處理。底下這條教訓還是有效（fallback path、daemon 自身與 child 之間都會碰到），但日常不再每分鐘踩一次。
+
 openclaw-b 的 PID 1 是 `openclaw` 本身（node process），**不 reap 子孫**。從 bridge `asyncio.create_subprocess_exec` spawn 出 hermes process 後若異常退出，`await proc.communicate()` 會永遠卡住。
 
 症狀：bridge log 卡在「event=message... spawning chat」之後沒有 reply/error，`ps` 卻看不到 hermes process。
@@ -187,11 +189,15 @@ except asyncio.TimeoutError:
     return "[timeout]"
 ```
 
-**另一層**：Hermes session file 是本地共享資源，併發 spawn 會搶著寫。用 `asyncio.Lock` 串行化。
+**另一層**：Hermes session file 是本地共享資源，併發 spawn 會搶著寫。用 `asyncio.Lock` 串行化。（**daemon 模式下** 這個鎖搬進 daemon 的 worker queue，bridge 端不再需要。）
 
 ---
 
-## 14. Hermes cold start 每次 ~7-9 秒
+## 14. Hermes cold start ~~每次~~ ~7-9 秒
+
+> **2026-04-28 update — 已被 daemon 解決**：`hermes_daemon.py` 在 boot 時起一個 `hermes --continue` 常駐 child，冷啟成本 **只付一次**。後續 `POST /chat` 走 stdin pipe，per-message latency = Hermes 推論時間而已（typically 1-3s）。底下保留歷史紀錄，並保留 fallback path 仍會踩到的描述。
+>
+> Fallback path（`HERMES_DAEMON_URL` 沒設或 daemon 不可達）仍會 per-message spawn — 那個分支會回到下面這套延遲分布。
 
 `hermes chat -q` 冷啟動時間分布：
 - Python + venv 載入：~2-3s
@@ -200,13 +206,13 @@ except asyncio.TimeoutError:
 
 省掉 `uv run`（直接執行 `.venv/bin/hermes`）只省 ~0.2s，不顯著。
 
-**目前 POC 接受這個延遲**，因為一對一 chat 且訊息頻率不高。
+~~**目前 POC 接受這個延遲**~~ → **2026-04-28 已切換 option B** (out-of-process daemon)。
 
-**未來優化方向**（未實作）：
-1. 自寫 Python worker：startup 時 `from run_agent import AIAgent` 一次，listen on Unix socket，bridge 透過 socket 送請求
-2. 改用 Hermes MCP server (`hermes mcp`)：JSON-RPC 介面可能支援 keep-alive
-3. 改用 Hermes dashboard HTTP API（存在於 `hermes dashboard`）
-4. 直接丟開 Hermes 用 SDK（minimax client）— 但失去 Hermes 的 tools/memory/skills
+歷史上考慮過的方向，最終選 #1：
+1. ✅ **採用** — 自寫 Python worker：startup 時 spawn 一個 `hermes --continue` 進去裝好 venv + 載 Hermes 的容器，listen on aiohttp `:8645`，bridge 透過 HTTP+SSE 送請求。實作見 `daemon/hermes_daemon.py` + `daemon/hermes_worker.py`，spec 見 `docs/SPEC-bridge-refactor.md`。
+2. ❌ 改用 Hermes MCP server (`hermes mcp`)：JSON-RPC 介面有 keep-alive 但工具相容性差。
+3. ❌ 改用 Hermes dashboard HTTP API：實驗性、文件不全。
+4. ❌ 直接丟開 Hermes 用 SDK（minimax client）— 失去 Hermes 的 tools/memory/skills。
 
 ---
 
