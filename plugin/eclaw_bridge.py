@@ -34,6 +34,7 @@ import os
 import re
 import subprocess
 import textwrap
+import time
 import uuid
 from typing import Any
 
@@ -68,8 +69,7 @@ DAEMON_CONNECT_TIMEOUT = float(os.environ.get("HERMES_DAEMON_CONNECT_TIMEOUT", "
 # (NousResearch issue #7536 stuck-session-on-restart loop). Default 5min;
 # bump if your latency budget exceeds that.
 STALE_WEBHOOK_THRESHOLD_S = int(os.environ.get("HERMES_STALE_WEBHOOK_THRESHOLD_S", "300"))
-import time as _time
-_BOOT_TS = _time.time()
+_BOOT_TS = time.time()
 
 # Kept as a safety net — if Hermes still happens to output this exact token
 # (e.g. from system prompt or memory), skip the reply.
@@ -328,7 +328,7 @@ async def handle_webhook(request: web.Request) -> web.Response:
     # bridge booted (or older than threshold) get a 200 OK + log + drop.
     msg_ts_ms = body.get("timestamp")
     if isinstance(msg_ts_ms, (int, float)):
-        msg_age_s = _time.time() - (msg_ts_ms / 1000)
+        msg_age_s = time.time() - (msg_ts_ms / 1000)
         if msg_age_s > STALE_WEBHOOK_THRESHOLD_S:
             log.warning(
                 "[stale-drop] webhook age %.1fs > %ds threshold; ignoring "
