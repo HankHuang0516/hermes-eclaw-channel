@@ -14,17 +14,36 @@ Bridge [Hermes Agent](https://github.com/NousResearch/hermes-agent) (NousResearc
 │ EClaw      │ ─────────────────────────▶ │ cloudflared-hermes-b │
 │ backend    │                            │ (named tunnel)       │
 └────────────┘ ◀────────────────────────┐ └──────────┬───────────┘
-  3. POST /api/channel/message          │            │
+  4. POST /api/channel/message          │            │
      reply                              │            ▼
                                         │ ┌─────────────────────┐
                                         │ │ eclaw_bridge.py :8644│
                                         │ │  • Bearer auth       │
-                                        │ │  • spawn hermes chat │
+                                        │ │  • POST /chat → SSE  │
                                         │ │  • POST reply back   │
-                                        │ └─────────────────────┘
-                                        │            │
-                                        └────────────┘ 2. hermes chat -q
+                                        │ └──────────┬──────────┘
+                                        │            │ 2. POST /chat (SSE)
+                                        │            ▼
+                                        │ ┌─────────────────────┐
+                                        │ │ hermes_daemon.py     │
+                                        │ │ :8645 (aiohttp)      │
+                                        │ │  • persistent hermes │
+                                        │ │    --continue child  │
+                                        │ │  • SSE event stream  │
+                                        │ └──────────┬──────────┘
+                                        │            │ 3. stdin/stdout
+                                        └────────────┘    pipe
 ```
+
+> **2026-04-28** — bridge now talks to a long-lived `hermes_daemon` (option B
+> from [`docs/SPEC-bridge-refactor.md`](./docs/SPEC-bridge-refactor.md)) over
+> loopback HTTP + SSE. Daemon owns one persistent `hermes --continue` child, so
+> cold start cost is paid once at boot, not per message. If `HERMES_DAEMON_URL`
+> is unset or the daemon is unreachable, the bridge automatically falls back
+> to the legacy per-request `hermes chat` subprocess — zero-risk migration.
+>
+> See [`docs/API-bridge-http-daemon.md`](./docs/API-bridge-http-daemon.md) for
+> endpoint surface, SSE event types, and fallback semantics.
 
 ---
 
@@ -60,7 +79,11 @@ Once running, anyone who messages the bot (via EClaw app or `https://eclawbot.co
 
 | Path | Purpose |
 |------|---------|
-| `plugin/eclaw_bridge.py` | Main Python server — receives webhook, invokes Hermes, posts reply |
+| `plugin/eclaw_bridge.py` | Main Python server — receives webhook, posts to daemon (or falls back to subprocess), posts reply back to EClaw |
+| `daemon/hermes_daemon.py` | Long-lived aiohttp server on `:8645`. Owns the persistent `hermes --continue` child. `POST /chat` returns SSE event stream. |
+| `daemon/hermes_worker.py` | Inner worker that pipes prompts to the persistent Hermes process and parses replies. |
+| `docs/SPEC-bridge-refactor.md` | A/B/C refactor evaluation — why option B (out-of-process daemon) won. |
+| `docs/API-bridge-http-daemon.md` | Daemon HTTP/SSE endpoint reference (POST /chat, /health, event types, fallback rules). |
 | `scripts/setup-tunnel.sh` | Create Cloudflare named tunnel + DNS CNAME via API |
 | `scripts/bind-entity.sh` | EClaw `/register` + `/bind` (saves botSecret to Keychain) |
 | `scripts/up-bridge.sh` | **Recommended** — run bridge as its own container with `restart: unless-stopped` |
@@ -83,10 +106,13 @@ Once running, anyone who messages the bot (via EClaw app or `https://eclawbot.co
 
 ## Known limitations
 
-1. **Cold start ~7-9s per message** — each inbound spawns `hermes chat`. See [KNOW-HOW §14](./KNOW-HOW.md) for ideas to make warm.
-2. **No HMAC signing** — gateway runs in `INSECURE_NO_AUTH` mode. Bearer token check is in the bridge itself.
-3. **Serialized replies** — `asyncio.Lock` serializes Hermes calls. Two concurrent EClaw messages are handled sequentially.
-4. **Keychain is host-only** — for CI/prod need to switch to env file or a secret manager.
+1. **No HMAC signing** — gateway runs in `INSECURE_NO_AUTH` mode. Bearer token check is in the bridge itself.
+2. **Serialised replies inside daemon** — the persistent `hermes --continue` child is single-threaded by Hermes design, so the daemon serialises concurrent `POST /chat` requests via an internal queue. EClaw delivery is async, so callers don't block; replies are streamed back over SSE in the order requests were enqueued.
+3. **Keychain is host-only** — for CI/prod need to switch to env file or a secret manager.
+
+> **Historical (resolved by daemon refactor 2026-04-28):**
+> - ~~Cold start ~7-9s per message~~ — daemon's persistent child pays this once at boot. Per-message latency now ≈ Hermes inference time only. Subprocess fallback path keeps the old behaviour when daemon is unreachable.
+> - ~~Bridge-level `asyncio.Lock` serialises Hermes calls~~ — lock moved into the daemon's worker queue; the bridge itself can fan out.
 
 ---
 
