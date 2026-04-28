@@ -115,6 +115,7 @@ async def speak_to(session: ClientSession, to_entity_id: int, text: str, expects
 # NOTE on regex: the quota line can embed nested brackets (`"[SILENT]"`),
 # so we can't rely on the outer `]` to close — just consume to end-of-line.
 _QUOTA_LINE_RE = re.compile(r"^\[Quota:.*$", re.MULTILINE)
+_RICH_OPEN_BRACKET_RE = re.compile(r"\[")
 
 
 def _strip_eclaw_context(text: str) -> str:
@@ -135,6 +136,16 @@ def _strip_eclaw_context(text: str) -> str:
             text = text[:idx]
     text = _QUOTA_LINE_RE.sub("", text)
     return text.strip()
+
+
+def _escape_rich_brackets(text: str) -> str:
+    """Mirror of ``daemon/hermes_worker.py::escape_rich_brackets``.
+
+    See that function for the full rationale. Both code paths (daemon HTTP +
+    subprocess fallback) MUST escape identically — divergence means kanban
+    nudges crash on one path and succeed on the other, masking the bug.
+    """
+    return _RICH_OPEN_BRACKET_RE.sub(r"\\[", text)
 
 
 HERMES_TIMEOUT = int(os.environ.get("HERMES_TIMEOUT_SECS", "900"))
@@ -259,6 +270,7 @@ async def _ask_hermes_subprocess(prompt: str) -> str:
     fallback when the daemon is unreachable.
     """
     clean = _strip_eclaw_context(prompt)
+    safe = _escape_rich_brackets(clean)
     log.info("[hermes] spawning chat, prompt_len=%d", len(clean))
 
     # --continue reuses the most recent session → agent retains conversation
@@ -268,7 +280,7 @@ async def _ask_hermes_subprocess(prompt: str) -> str:
     # mid-task forward (also feeds ANSI-stripped output to EClaw chat).
     args = [
         "/home/node/hermes-agent/.venv/bin/hermes",  # skip `uv run` overhead
-        "chat", "-q", clean, "--continue",
+        "chat", "-q", safe, "--continue",
     ]
 
     async with _hermes_lock:  # serialize to protect session files
@@ -296,7 +308,9 @@ async def _ask_hermes_subprocess(prompt: str) -> str:
             return "[Hermes 回應超時]"
 
     if proc.returncode != 0:
-        log.error("[hermes] exit %d: %s", proc.returncode, stderr.decode()[:500])
+        # 4000-char cap: prior 500-char limit truncated mid-traceback and
+        # hid the rich.MarkupError crash that motivated this very escape.
+        log.error("[hermes] exit %d: %s", proc.returncode, stderr.decode()[:4000])
         return "[Hermes 回覆失敗 — 請查 log]"
 
     raw = _ANSI_RE.sub("", stdout.decode())
