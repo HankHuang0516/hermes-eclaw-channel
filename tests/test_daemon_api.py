@@ -46,6 +46,12 @@ async def test_health_ok(client, daemon_module):
     assert body["status"] == "ok"
     assert body["service"] == "hermes-daemon"
     assert "uptime_s" in body and body["in_flight"] == 0
+    # Phase H1: worker state surfaced for autoheal sidecar visibility.
+    for k in ("queue_max", "calls_total", "resume_auto_disabled",
+              "no_resume_env", "idle_timeout_s", "wall_timeout_s"):
+        assert k in body, f"/health missing {k}"
+    assert body["resume_auto_disabled"] is False  # fresh process
+    assert body["queue_max"] == 8
 
 
 async def test_version(client, daemon_module):
@@ -163,3 +169,23 @@ async def test_chat_sse_silent(client, daemon_module, monkeypatch):
     body = (await r.read()).decode()
     assert "event: silent" in body
     assert "event: done" not in body
+
+
+async def test_chat_busy_returns_503(client, daemon_module):
+    """Phase H1: queue-full must use 503, not 429.
+
+    vLLM RFC #18826 / tianpan.co backpressure: 429 implies "retry now" which
+    sustains overload; 503 signals upstream to back off + circuit-break.
+    """
+    daemon_module._state["queue_depth"] = daemon_module.QUEUE_MAX
+    try:
+        r = await client.post(
+            "/chat",
+            json={"prompt": "hi", "request_id": "abc"},
+            headers={"Authorization": "Bearer test-token", "Accept": "application/json"},
+        )
+        assert r.status == 503
+        body = await r.json()
+        assert body["error"]["kind"] == "busy"
+    finally:
+        daemon_module._state["queue_depth"] = 0
