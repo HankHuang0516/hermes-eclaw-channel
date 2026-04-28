@@ -54,12 +54,22 @@ def _err(kind: str, detail: str, status: int) -> web.Response:
 
 async def health(_: web.Request) -> web.Response:
     uptime_s = int(time.time() - _state["started_at"])
+    # Surface Phase H1 worker state — Docker HEALTHCHECK + autoheal sidecar
+    # read this; if `resume_auto_disabled=true` while in_flight=0 and
+    # queue_depth=0, the daemon is alive but on degraded mode (started fresh
+    # because session resume tripped on first call after boot).
     return web.json_response({
         "status": "ok",
         "service": "hermes-daemon",
         "uptime_s": uptime_s,
         "in_flight": _state["in_flight"],
         "queue_depth": _state["queue_depth"],
+        "queue_max": QUEUE_MAX,
+        "calls_total": hermes_worker._call_count,
+        "resume_auto_disabled": hermes_worker._resume_auto_disabled,
+        "no_resume_env": hermes_worker.HERMES_NO_RESUME,
+        "idle_timeout_s": hermes_worker.IDLE_TIMEOUT,
+        "wall_timeout_s": hermes_worker.DEFAULT_TIMEOUT,
     })
 
 
@@ -148,7 +158,10 @@ async def chat(req: web.Request) -> web.StreamResponse:
         body["request_id"] = str(uuid.uuid4())
 
     if _state["queue_depth"] >= QUEUE_MAX:
-        return _err("busy", f"queue depth {_state['queue_depth']} >= {QUEUE_MAX}", 429)
+        # Load-shedding: 503 (Service Unavailable) signals the upstream to back
+        # off + circuit-break. 429 implies "retry now" which makes sustained
+        # overload worse — vLLM RFC #18826 + tianpan.co backpressure pattern.
+        return _err("busy", f"queue depth {_state['queue_depth']} >= {QUEUE_MAX}", 503)
 
     _state["queue_depth"] += 1
     try:
