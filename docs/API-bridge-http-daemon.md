@@ -87,7 +87,9 @@ terminal-failure. The stream closes after any terminal event.
 …or:
 
 ```json
-{ "ok": false, "error": { "kind": "timeout", "detail": "after 900s" } }
+{ "ok": false, "error": { "kind": "timeout", "detail": "idle for 60s" } }
+// or, if the wall-clock backstop fires instead of idle:
+{ "ok": false, "error": { "kind": "timeout", "detail": "wall-clock 900s" } }
 ```
 
 ### `GET /health`
@@ -95,11 +97,25 @@ terminal-failure. The stream closes after any terminal event.
 ```
 200 OK
 { "status": "ok", "service": "hermes-daemon", "uptime_s": 1234,
-  "hermes_version": "0.x.y", "in_flight": 1, "queue_depth": 0 }
+  "hermes_version": "0.x.y", "in_flight": 1, "queue_depth": 0,
+  "queue_max": 8, "calls_total": 42,
+  "resume_auto_disabled": false, "no_resume_env": false,
+  "idle_timeout_s": 60, "wall_timeout_s": 900 }
 ```
 
-`in_flight` + `queue_depth` let the bridge surface back-pressure (e.g. log a
-warning when queue grows past N).
+`in_flight` + `queue_depth` + `queue_max` let the bridge surface back-pressure
+(e.g. log a warning when queue grows past N). Phase H1 added the worker-state
+fields so the autoheal sidecar / bridge can detect degraded mode without
+exec'ing into the container:
+
+- `calls_total` — monotonic counter; jumps + queue_depth=0 + in_flight=0
+  means the daemon is healthy and processing.
+- `resume_auto_disabled` — `true` once the first call after boot timed out
+  with `--continue` (NousResearch issue #7536 mitigation). Stays on for the
+  daemon's lifetime; restart re-evaluates.
+- `no_resume_env` — reflects `HERMES_NO_RESUME` env (manual kill switch).
+- `idle_timeout_s` / `wall_timeout_s` — the two deadlines (idle is primary,
+  wall is backstop).
 
 ### `GET /version`
 
@@ -125,8 +141,8 @@ Shared bearer token: `Authorization: Bearer <HERMES_DAEMON_TOKEN>`.
 |----------------|------------------|------------------------------------------------------------------|------------------------------------|
 | `bad_request`  | 400              | Missing `prompt` / `request_id`, malformed JSON.                | Log + drop (don't retry).          |
 | `unauthorized` | 401              | Bearer mismatch.                                                | Log + escalate (config bug).       |
-| `busy`         | 429              | Queue depth exceeds `HERMES_DAEMON_QUEUE_MAX` (default 8).      | Fall back to subprocess.           |
-| `timeout`      | 504              | Hermes worker exceeded `HERMES_DAEMON_CHAT_TIMEOUT_SECS` (900). | Return `[Hermes 回應超時]` to user. |
+| `busy`         | 503              | Queue depth exceeds `HERMES_DAEMON_QUEUE_MAX` (default 8). Phase H1: was 429 — switched to 503 per vLLM RFC #18826 backpressure (429 implies "retry now" which sustains overload). | Fall back to subprocess.           |
+| `timeout`      | 504              | Phase H1: idle-activity (no stdout chunk for `HERMES_IDLE_TIMEOUT_SECS`, default 60) **or** wall-clock (`HERMES_DAEMON_CHAT_TIMEOUT_SECS`, default 900). `detail` is `idle for Ns` or `wall-clock Ns`. | Return `[Hermes 回應超時]` to user. |
 | `spawn_failed` | 503              | Worker process couldn't start.                                   | Fall back to subprocess.           |
 | `hermes_exit`  | 502              | Worker exited non-zero.                                          | Return `[Hermes 回覆失敗 — 請查 log]`. |
 
@@ -168,17 +184,20 @@ Rules for the shim:
 These come from `SPEC-bridge-refactor.md §1` (current bridge contract). The
 daemon implementation cannot break any of them:
 
-1. **Single-session `--continue` semantics.** v0 uses one Hermes session for
-   the whole daemon process. `_hermes_lock` is internal to the daemon and gates
-   the worker; from the bridge's perspective concurrent `POST /chat` calls just
-   queue.
+1. **Session continuity is best-effort, not guaranteed.** v0 used `--continue`
+   unconditionally. **Phase H1**: `--continue` drops on `HERMES_NO_RESUME=1`
+   *or* once the first call after boot times out (issue #7536 mitigation).
+   Bridge MUST NOT depend on Hermes remembering prior context across daemon
+   restarts. `_hermes_lock` still serialises all CLI spawns from the daemon.
 2. **`[SILENT]` short-circuit.** If the extracted reply contains the literal
    `[SILENT]`, daemon emits an `event: silent` and the bridge skips delivery.
 3. **`_extract_hermes_reply` envelope-stripping.** The daemon imports the same
    helper (or a copy) from `plugin/eclaw_bridge.py` so head/tail markers stay
    in lock-step. Tests for both must share fixtures.
-4. **Timeout budget = 900 s** by default, env-overridable. Same default as the
-   current bridge.
+4. **Two timeouts, idle is primary.** `HERMES_IDLE_TIMEOUT_SECS` (default 60)
+   kills the subprocess when no stdout chunk has arrived for that long;
+   `HERMES_DAEMON_CHAT_TIMEOUT_SECS` (default 900) is the wall-clock backstop.
+   v0 only had wall-clock; Phase H1 added idle-activity per issue #4815.
 5. **No prompt prefixing.** Daemon does NOT inject sender labels — that's the
    bridge's job (see `process_message` for `entity_message`/`broadcast`).
 
@@ -209,6 +228,19 @@ tests/
 scripts/
   run-daemon.sh             # local dev launcher
 ```
+
+## 8b. Phase H1 environment variables
+
+Added 2026-04-28 in response to PR #2201 same-day recurrence. All optional —
+sensible defaults match the v0 contract.
+
+| Var | Default | Purpose |
+|-----|---------|---------|
+| `HERMES_IDLE_TIMEOUT_SECS` | `60` | Kill subprocess if no stdout chunk arrives for this many seconds. Primary deadline. |
+| `HERMES_DAEMON_CHAT_TIMEOUT_SECS` | `900` | Wall-clock backstop. Was the only deadline in v0. |
+| `HERMES_NO_RESUME` | `""` (off) | When `1`/`true`/`yes`, daemon never passes `--continue` to hermes. Manual kill switch for stuck sessions. Auto-engaged for the daemon's lifetime if first call after boot times out with `--continue`. |
+| `HERMES_DAEMON_QUEUE_MAX` | `8` | When queue depth ≥ this, return `503 busy` (was `429` in v0). |
+| `HERMES_STALE_WEBHOOK_THRESHOLD_S` | `300` | Bridge drops EClaw webhook deliveries whose `timestamp` is older than this many seconds; mitigates startup-flood-of-stale-messages re-triggering the same wedge. |
 
 ## 9. Open questions for review
 
