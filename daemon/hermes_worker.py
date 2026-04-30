@@ -35,9 +35,18 @@ IDLE_TIMEOUT = int(os.environ.get("HERMES_IDLE_TIMEOUT_SECS", "60"))
 
 # Skip `--continue` (don't resume the most recent session) — used as a manual
 # kill switch when an unrecoverable session is wedging every restart, and
-# auto-engaged on first-call timeout-after-boot (issue #7536: stuck-session-
-# on-restart loop). Once auto-engaged, stays on for the daemon's lifetime.
+# auto-engaged after MAX_CONSECUTIVE_TIMEOUTS consecutive timeouts (issue
+# #7536: stuck-session-on-restart loop). Once auto-engaged, stays on for the
+# daemon's lifetime.
 HERMES_NO_RESUME = os.environ.get("HERMES_NO_RESUME", "").lower() in ("1", "true", "yes")
+
+# Auto-disable resume after this many consecutive timeouts. Was previously
+# "first call only," but a daemon that rolls past its first call and *then*
+# enters a wedge (e.g. a session jsonl gets corrupted mid-lifetime by a kill
+# -9, or a long-running session crosses a hermes CLI version boundary on
+# rebuild) would keep re-poisoning itself forever. 2 consecutive timeouts is
+# enough signal that resume is the problem, not the LLM.
+MAX_CONSECUTIVE_TIMEOUTS = int(os.environ.get("HERMES_MAX_CONSECUTIVE_TIMEOUTS", "2"))
 
 HERMES_BIN = os.environ.get("HERMES_BIN", "/home/node/hermes-agent/.venv/bin/hermes")
 HERMES_CWD = os.environ.get("HERMES_CWD", "/home/node/hermes-agent")
@@ -46,6 +55,7 @@ HERMES_PATH_PREPEND = os.environ.get("HERMES_PATH_PREPEND", "/home/node/.local/b
 # Module state for the auto-disable-resume logic. Per-process is fine —
 # one daemon process per container, and on restart we re-evaluate.
 _call_count = 0
+_consecutive_timeouts = 0
 _resume_auto_disabled = False
 
 _QUOTA_LINE_RE = re.compile(r"^\[Quota:.*$", re.MULTILINE)
@@ -195,12 +205,11 @@ async def run_chat(prompt: str, timeout: Optional[int] = None) -> HermesResult:
       - --continue is dropped when HERMES_NO_RESUME=1 OR after the first call
         post-boot times out (auto-detection of stuck-session-on-restart).
     """
-    global _call_count, _resume_auto_disabled
+    global _call_count, _consecutive_timeouts, _resume_auto_disabled
     clean = strip_eclaw_context(prompt)
     safe = escape_rich_brackets(clean)
     wall_deadline = timeout if timeout is not None else DEFAULT_TIMEOUT
     use_continue = not (HERMES_NO_RESUME or _resume_auto_disabled)
-    is_first_call = _call_count == 0
     _call_count += 1
 
     args = [HERMES_BIN, "chat", "-q", safe]
@@ -251,16 +260,23 @@ async def run_chat(prompt: str, timeout: Optional[int] = None) -> HermesResult:
                     await asyncio.wait_for(t, timeout=2)
                 except Exception:
                     t.cancel()
-            # Auto-disable --continue if the FIRST call after boot times out.
-            # Maps to NousResearch issue #7536 (stuck-session-on-restart loop):
-            # if we just resumed a wedged session, disable resume so the next
-            # call starts fresh instead of re-entering the same wedge.
-            if is_first_call and use_continue and not _resume_auto_disabled:
+            # Track consecutive timeouts and auto-disable --continue once we
+            # cross MAX_CONSECUTIVE_TIMEOUTS in a row (NousResearch issue
+            # #7536, stuck-session-on-restart loop). Bumping this counter
+            # even when resume is already disabled is harmless — the gate
+            # below short-circuits on _resume_auto_disabled.
+            _consecutive_timeouts += 1
+            if (
+                use_continue
+                and not _resume_auto_disabled
+                and _consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS
+            ):
                 _resume_auto_disabled = True
                 log.warning(
-                    "[hermes] first-call %s with --continue → auto-disabling "
-                    "session resume for the rest of this daemon's lifetime",
-                    outcome,
+                    "[hermes] %d consecutive %s timeouts with --continue → "
+                    "auto-disabling session resume for the rest of this "
+                    "daemon's lifetime",
+                    _consecutive_timeouts, outcome,
                 )
             kind = "timeout" if outcome == "idle" else "timeout"
             detail = (f"idle for {IDLE_TIMEOUT}s" if outcome == "idle"
@@ -283,6 +299,10 @@ async def run_chat(prompt: str, timeout: Optional[int] = None) -> HermesResult:
         # crash that caused this very file to exist had its key frame at byte
         # ~700, beyond the previous 500-char limit — silent diagnosis loss).
         raise HermesError("hermes_exit", f"rc={proc.returncode}: {stderr_bytes.decode(errors='replace')[:4000]}")
+
+    # Clean exit ⇒ resume isn't poisoned right now; reset the streak so a
+    # one-off timeout doesn't drift us into the auto-disable threshold.
+    _consecutive_timeouts = 0
 
     raw = _ANSI_RE.sub("", stdout_bytes.decode(errors="replace"))
     reply = extract_hermes_reply(raw)
