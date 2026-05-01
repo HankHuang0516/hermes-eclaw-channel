@@ -80,3 +80,14 @@ def test_escape_brackets_no_change_when_no_open() -> None:
 
 def test_silent_token_constant() -> None:
     assert w.SILENT_TOKEN == "[SILENT]"
+
+
+def test_apply_prompt_policy_wraps_hermes_prompt() -> None:
+    wrapped = b.apply_prompt_policy("hello", "## Device Instructions\nReport progress.")
+    assert wrapped.startswith("[EClaw managed prompt policy - hermes]\n")
+    assert "## Device Instructions\nReport progress." in wrapped
+    assert wrapped.endswith("\nhello")
+
+
+def test_apply_prompt_policy_empty_noop() -> None:
+    assert b.apply_prompt_policy("hello", "") == "hello"
