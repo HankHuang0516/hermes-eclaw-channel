@@ -76,6 +76,20 @@ _BOOT_TS = time.time()
 SILENT_TOKEN = "[SILENT]"
 
 
+def apply_prompt_policy(prompt: str, compiled_prompt: str) -> str:
+    """Prepend centrally managed EClaw prompt policy when available."""
+    policy = (compiled_prompt or "").strip()
+    if not policy:
+        return prompt
+    return "\n".join([
+        "[EClaw managed prompt policy - hermes]",
+        policy,
+        "[End EClaw managed prompt policy]",
+        "",
+        prompt,
+    ])
+
+
 # --- EClaw API ------------------------------------------------------------
 
 async def send_message(session: ClientSession, text: str, state: str = "IDLE") -> dict:
@@ -108,6 +122,33 @@ async def speak_to(session: ClientSession, to_entity_id: int, text: str, expects
     async with session.post(f"{API_BASE}/api/entity/speak-to", json=body) as r:
         if r.status >= 400:
             log.error("speak_to %d failed: %s", to_entity_id, await r.text())
+
+
+async def fetch_prompt_policy(session: ClientSession) -> str:
+    """GET /api/channel/prompt-policy for this bound Hermes entity.
+
+    Failure is non-fatal: channel delivery must continue even if policy preview
+    or deployment is temporarily unavailable.
+    """
+    params = {
+        "deviceId": DEVICE_ID,
+        "entityId": str(ENTITY_ID),
+        "botSecret": BOT_SECRET,
+        "channel": "hermes",
+    }
+    try:
+        async with session.get(f"{API_BASE}/api/channel/prompt-policy", params=params) as r:
+            if r.status >= 400:
+                log.warning("prompt policy fetch failed: http %d", r.status)
+                return ""
+            data = await r.json()
+    except Exception as e:
+        log.warning("prompt policy fetch skipped: %s", e)
+        return ""
+
+    if data.get("success") is False:
+        return ""
+    return ((data.get("policy") or {}).get("compiledPrompt") or "").strip()
 
 
 # --- Hermes invocation ---------------------------------------------------
@@ -387,6 +428,11 @@ async def process_message(msg: dict) -> None:
         sender = f"Entity {from_entity_id}" + (f" ({from_character})" if from_character else "")
         prefix = "Broadcast from" if event == "broadcast" else "Bot-to-Bot from"
         prompt = f"[{prefix} {sender}]\n{text}" if text else f"[{prefix} {sender}]"
+
+    async with ClientSession() as s:
+        compiled_policy = await fetch_prompt_policy(s)
+
+    prompt = apply_prompt_policy(prompt, compiled_policy)
 
     log.info("event=%s from=%s text=%r", event, from_entity_id or "user", text[:80])
     reply = await ask_hermes(prompt)
