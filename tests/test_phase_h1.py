@@ -248,3 +248,57 @@ async def test_consecutive_timeouts_resets_on_success(monkeypatch):
         await w.run_chat("third")
     assert w._consecutive_timeouts == 1
     assert w._resume_auto_disabled is False
+
+
+async def test_timeout_error_includes_redacted_stdout_stderr_tail(monkeypatch):
+    """Timeout diagnostics must preserve the last emitted tool lines.
+
+    The original Hermes file-edit wedge streamed repeated grep/awk attempts,
+    but daemon timeout errors only said idle/wall timeout. Including a bounded,
+    redacted tail makes the next wedge diagnosable from the rootcause card/logs.
+    """
+    monkeypatch.setattr(w, "_call_count", 0)
+    monkeypatch.setattr(w, "_consecutive_timeouts", 0)
+    monkeypatch.setattr(w, "_resume_auto_disabled", False)
+    monkeypatch.setenv("HERMES_GH_PAT", "SECRET_TOKEN")
+    monkeypatch.setattr(w, "PR_ONLY_ENABLED", False)
+
+    class _Proc:
+        returncode = None
+
+        def __init__(self):
+            self.stdout = "stdout-stream"
+            self.stderr = "stderr-stream"
+
+        def kill(self):
+            self.returncode = -9
+
+        async def wait(self):
+            return self.returncode if self.returncode is not None else -9
+
+    async def _fake_create(*_a, **_k):
+        return _Proc()
+
+    async def _fake_drain(stream, sink, last_activity):
+        if stream == "stdout-stream":
+            sink.append(b"grep backend/public/shared/i18n.js SECRET_TOKEN\n")
+        else:
+            sink.append(b"awk failed: no such file or directory\n")
+
+    async def _always_wall(*_a, **_k):
+        return "wall"
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_create)
+    monkeypatch.setattr(w, "_drain_stream", _fake_drain)
+    monkeypatch.setattr(w, "_wait_for_idle_or_exit", _always_wall)
+
+    with pytest.raises(w.HermesError) as e:
+        await w.run_chat("Please edit backend/public/shared/i18n.js")
+
+    assert e.value.kind == "timeout"
+    assert "stdout_tail=" in e.value.detail
+    assert "stderr_tail=" in e.value.detail
+    assert "grep backend/public/shared/i18n.js" in e.value.detail
+    assert "awk failed" in e.value.detail
+    assert "SECRET_TOKEN" not in e.value.detail
+    assert "***" in e.value.detail
