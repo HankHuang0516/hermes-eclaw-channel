@@ -189,6 +189,21 @@ def _redact_secret(text: str, token: str | None = None) -> str:
     return out
 
 
+
+
+def _tail_text(chunks: list, *, limit: int = 2000) -> str:
+    """Return a redacted text tail for timeout diagnostics.
+
+    Timeout bugs are often only diagnosable from the last tool/CLI lines. Keep
+    this bounded and secret-redacted so daemon logs and JSON/SSE errors can
+    include useful evidence without leaking tokens.
+    """
+    if not chunks:
+        return ""
+    tail = b"".join(chunks)[-limit:]
+    return _redact_secret(tail.decode(errors="replace"))
+
+
 def _run(cmd: list[str], *, cwd: str | Path | None = None, env: dict | None = None, timeout: int = 120) -> subprocess.CompletedProcess:
     token = (env or {}).get("HERMES_GH_PAT")
     try:
@@ -476,6 +491,12 @@ async def _run_chat_subprocess(prompt: str, timeout: Optional[int] = None, *, cw
             kind = "timeout" if outcome == "idle" else "timeout"
             detail = (f"idle for {IDLE_TIMEOUT}s" if outcome == "idle"
                       else f"wall-clock {wall_deadline}s")
+            stdout_tail = _tail_text(stdout_chunks)
+            stderr_tail = _tail_text(stderr_chunks)
+            if stdout_tail:
+                detail += f"; stdout_tail={stdout_tail!r}"
+            if stderr_tail:
+                detail += f"; stderr_tail={stderr_tail!r}"
             raise HermesError(kind, detail)
 
         # Process exited normally — wait for drains to finish.
