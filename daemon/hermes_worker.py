@@ -12,7 +12,12 @@ import asyncio
 import logging
 import os
 import re
+import shutil
+import subprocess
+import tempfile
 import textwrap
+import uuid
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional
 
@@ -52,6 +57,20 @@ HERMES_BIN = os.environ.get("HERMES_BIN", "/home/node/hermes-agent/.venv/bin/her
 HERMES_CWD = os.environ.get("HERMES_CWD", "/home/node/hermes-agent")
 HERMES_PATH_PREPEND = os.environ.get("HERMES_PATH_PREPEND", "/home/node/.local/bin")
 
+
+# PR-only flow for file-edit tasks. The hermes daemon container does not mount
+# the EClaw repository, so prompts that ask Hermes to edit files can otherwise
+# loop forever grepping paths that do not exist. When a task looks like a
+# file-edit task, clone the repo into an ephemeral workdir, let Hermes edit
+# there, then commit/push/open a PR. Text-only tasks keep the original flow.
+PR_ONLY_ENABLED = os.environ.get("HERMES_PR_ONLY_ENABLED", "1").lower() in ("1", "true", "yes")
+PR_REPO_URL = os.environ.get("HERMES_PR_REPO_URL", "https://github.com/HankHuang0516/EClaw.git")
+PR_REPO_FULL_NAME = os.environ.get("HERMES_PR_REPO_FULL_NAME", "HankHuang0516/EClaw")
+PR_BASE_BRANCH = os.environ.get("HERMES_PR_BASE_BRANCH", "main")
+PR_BRANCH_PREFIX = os.environ.get("HERMES_PR_BRANCH_PREFIX", "hermes")
+PR_REVIEWER = os.environ.get("HERMES_PR_REVIEWER", "HankHuang0516")
+PR_WORKDIR_PARENT = os.environ.get("HERMES_PR_WORKDIR_PARENT", tempfile.gettempdir())
+
 # Module state for the auto-disable-resume logic. Per-process is fine —
 # one daemon process per container, and on restart we re-evaluate.
 _call_count = 0
@@ -65,6 +84,14 @@ _HERMES_TAIL_RE = re.compile(r"^(?:Resume this session with:|Session:\s+|Duratio
 _PURE_RULE_RE = re.compile(r"^[\s─━│╭╮╰╯═]+$")
 
 _RICH_OPEN_BRACKET_RE = re.compile(r"\[")
+
+_FILE_EDIT_RE = re.compile(
+    r"(\bedit\b|\bmodify\b|\bpatch\b|\bfix\b|\bupdate\b|\bcommit\b|\bpr\b|pull request|"
+    r"file-edit|翻譯|翻译|修復|修改|開出 PR|提 PR|backend/public/shared/i18n\.js|"
+    r"i18n|package\.json|\.py\b|\.js\b|\.ts\b|\.kt\b|\.html\b|\.css\b)",
+    re.IGNORECASE,
+)
+_TEXT_ONLY_RE = re.compile(r"\b(reply|answer|summari[sz]e|explain|translate only|只回覆|純文字)\b", re.IGNORECASE)
 
 
 def strip_eclaw_context(text: str) -> str:
@@ -125,6 +152,163 @@ def extract_hermes_reply(stdout: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", text)
 
 
+
+def is_file_edit_task(prompt: str) -> bool:
+    """Heuristic classifier for tasks that need repo file access.
+
+    Conservative bias: only route to PR-only when the prompt clearly mentions
+    file/code/i18n edit intent. Text-only replies must not pay clone/PR cost.
+    """
+    text = strip_eclaw_context(prompt or "")
+    if not text:
+        return False
+    if _TEXT_ONLY_RE.search(text) and not _FILE_EDIT_RE.search(text):
+        return False
+    return bool(_FILE_EDIT_RE.search(text))
+
+
+def _task_slug(prompt: str) -> str:
+    text = strip_eclaw_context(prompt or "")
+    # Prefer the first title-ish line; cap before slugifying so branch names stay sane.
+    line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "file-edit")[:80]
+    slug = re.sub(r"[^a-zA-Z0-9._-]+", "-", line).strip("-._").lower()
+    return (slug or "file-edit")[:48]
+
+
+def _github_pat() -> str:
+    # Do not log or print this value. The bridge/vault/bootstrap layer should
+    # expose device-owned HERMES_GH_PAT to the daemon process at runtime.
+    return os.environ.get("HERMES_GH_PAT", "").strip()
+
+
+def _redact_secret(text: str, token: str | None = None) -> str:
+    out = text or ""
+    for secret in (token, os.environ.get("HERMES_GH_PAT"), os.environ.get("GH_TOKEN"), os.environ.get("GITHUB_TOKEN")):
+        if secret:
+            out = out.replace(secret, "***")
+    return out
+
+
+def _run(cmd: list[str], *, cwd: str | Path | None = None, env: dict | None = None, timeout: int = 120) -> subprocess.CompletedProcess:
+    token = (env or {}).get("HERMES_GH_PAT")
+    try:
+        return subprocess.run(
+            cmd,
+            cwd=str(cwd) if cwd is not None else None,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        detail = f"{cmd[0]} exited {e.returncode}: {_redact_secret((e.stderr or e.stdout or '')[:1200], token)}"
+        raise HermesError("pr_flow_failed", detail) from e
+    except subprocess.TimeoutExpired as e:
+        detail = f"{cmd[0]} timed out after {timeout}s: {_redact_secret(str(e)[:1200], token)}"
+        raise HermesError("pr_flow_failed", detail) from e
+
+
+def _make_git_askpass(tmpdir: Path) -> Path:
+    script = tmpdir / "git-askpass.sh"
+    script.write_text(
+        "#!/usr/bin/env sh\n"
+        "case \"$1\" in\n"
+        "  *Username*) printf '%s' 'x-access-token' ;;\n"
+        "  *Password*) printf '%s' \"$HERMES_GH_PAT\" ;;\n"
+        "  *) printf '%s' \"$HERMES_GH_PAT\" ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o700)
+    return script
+
+
+def _pr_env(base_env: dict, tmpdir: Path, token: str) -> dict:
+    askpass = _make_git_askpass(tmpdir)
+    return {
+        **base_env,
+        "HERMES_GH_PAT": token,
+        "GH_TOKEN": token,
+        "GITHUB_TOKEN": token,
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_ASKPASS": str(askpass),
+    }
+
+
+async def _run_pr_only_chat(prompt: str, timeout: int) -> HermesResult:
+    """Execute a file-edit prompt inside a cloned EClaw repo and open a PR."""
+    token = _github_pat()
+    if not token:
+        raise HermesError("missing_github_pat", "HERMES_GH_PAT required for file-edit PR-only flow")
+    if not shutil.which("git"):
+        raise HermesError("missing_tool", "git CLI required for file-edit PR-only flow")
+    if not shutil.which("gh"):
+        raise HermesError("missing_tool", "gh CLI required for file-edit PR-only flow")
+
+    slug = _task_slug(prompt)
+    branch = f"{PR_BRANCH_PREFIX}/{slug}-{uuid.uuid4().hex[:8]}"
+    parent = Path(PR_WORKDIR_PARENT)
+    parent.mkdir(parents=True, exist_ok=True)
+    base_env = {**os.environ, "PATH": HERMES_PATH_PREPEND + ":" + os.environ.get("PATH", "")}
+
+    with tempfile.TemporaryDirectory(prefix="hermes-pr-", dir=str(parent)) as td:
+        tmpdir = Path(td)
+        env = _pr_env(base_env, tmpdir, token)
+        repo_dir = tmpdir / "EClaw"
+        log.info("[hermes-pr] cloning repo for file-edit task branch=%s slug=%s", branch, slug)
+        _run(["git", "clone", "--depth", "1", "--branch", PR_BASE_BRANCH, PR_REPO_URL, str(repo_dir)], env=env, timeout=180)
+        _run(["git", "checkout", "-b", branch], cwd=repo_dir, env=env)
+        _run(["git", "config", "user.name", "Hermes Bot"], cwd=repo_dir, env=env)
+        _run(["git", "config", "user.email", "hermes-bot@users.noreply.github.com"], cwd=repo_dir, env=env)
+
+        pr_prompt = "\n".join([
+            "[Hermes PR-only file-edit workspace]",
+            f"Repository has been cloned to: {repo_dir}",
+            f"Current branch: {branch}",
+            "Make the requested file edits in this working tree only.",
+            "Do not run git commit, git push, or gh pr create; the daemon will do that after you finish.",
+            "Keep the diff minimal and do not edit unrelated files.",
+            "[End Hermes PR-only file-edit workspace]",
+            "",
+            prompt,
+        ])
+        result = await _run_chat_subprocess(pr_prompt, timeout=timeout, cwd=str(repo_dir), use_continue=False)
+        status = _run(["git", "status", "--porcelain"], cwd=repo_dir, env=env).stdout.strip()
+        if not status:
+            reply = result.reply or "Hermes completed, but produced no file diff; no PR was opened."
+            return HermesResult(silent=result.silent, reply=reply, duration_ms=result.duration_ms)
+
+        _run(["git", "add", "-A"], cwd=repo_dir, env=env)
+        commit_title = f"Hermes file edit: {slug}"
+        _run(["git", "commit", "-m", commit_title], cwd=repo_dir, env=env)
+        _run(["git", "push", "origin", branch], cwd=repo_dir, env=env, timeout=180)
+        body = "\n".join([
+            "Automated Hermes PR-only file-edit flow.",
+            "",
+            "- Source: hermes-daemon PR-only clone workspace",
+            "- Branch created by daemon; review/merge handled by LOBSTER/Hank policy",
+            "- Token values are never printed in logs",
+            "",
+            "Hermes reply:",
+            result.reply or "(silent/no textual reply)",
+        ])
+        cmd = [
+            "gh", "pr", "create",
+            "--repo", PR_REPO_FULL_NAME,
+            "--base", PR_BASE_BRANCH,
+            "--head", branch,
+            "--title", commit_title,
+            "--body", body,
+        ]
+        if PR_REVIEWER:
+            cmd += ["--assignee", PR_REVIEWER]
+        pr_url = _run(cmd, cwd=repo_dir, env=env, timeout=180).stdout.strip()
+        reply = (result.reply + "\n\n" if result.reply else "") + f"Opened PR: {pr_url}"
+        return HermesResult(silent=False, reply=reply, duration_ms=result.duration_ms)
+
+
 @dataclass
 class HermesResult:
     silent: bool
@@ -140,6 +324,16 @@ class HermesError(Exception):
 
 
 _lock = asyncio.Lock()
+
+
+async def run_chat(prompt: str, timeout: Optional[int] = None) -> HermesResult:
+    """Route text tasks to Hermes directly and file-edit tasks to PR-only flow."""
+    clean = strip_eclaw_context(prompt)
+    wall_deadline = timeout if timeout is not None else DEFAULT_TIMEOUT
+    if PR_ONLY_ENABLED and is_file_edit_task(clean):
+        log.info("[hermes-pr] file-edit task detected; using PR-only clone flow")
+        return await _run_pr_only_chat(clean, timeout=wall_deadline)
+    return await _run_chat_subprocess(clean, timeout=wall_deadline)
 
 
 async def _drain_stream(stream: asyncio.StreamReader, sink: list, last_activity: list) -> None:
@@ -192,7 +386,7 @@ async def _wait_for_idle_or_exit(
             continue
 
 
-async def run_chat(prompt: str, timeout: Optional[int] = None) -> HermesResult:
+async def _run_chat_subprocess(prompt: str, timeout: Optional[int] = None, *, cwd: Optional[str] = None, use_continue: Optional[bool] = None) -> HermesResult:
     """Spawn one `hermes chat -q ... [--continue]` invocation.
 
     Lock-serialised — concurrent hermes CLI calls corrupt session jsonl files.
@@ -209,7 +403,8 @@ async def run_chat(prompt: str, timeout: Optional[int] = None) -> HermesResult:
     clean = strip_eclaw_context(prompt)
     safe = escape_rich_brackets(clean)
     wall_deadline = timeout if timeout is not None else DEFAULT_TIMEOUT
-    use_continue = not (HERMES_NO_RESUME or _resume_auto_disabled)
+    if use_continue is None:
+        use_continue = not (HERMES_NO_RESUME or _resume_auto_disabled)
     _call_count += 1
 
     args = [HERMES_BIN, "chat", "-q", safe]
@@ -230,7 +425,7 @@ async def run_chat(prompt: str, timeout: Optional[int] = None) -> HermesResult:
         try:
             proc = await asyncio.create_subprocess_exec(
                 *args,
-                cwd=HERMES_CWD,
+                cwd=cwd or HERMES_CWD,
                 env=env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
