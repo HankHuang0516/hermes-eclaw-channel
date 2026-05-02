@@ -90,11 +90,69 @@ def apply_prompt_policy(prompt: str, compiled_prompt: str) -> str:
     ])
 
 
+def apply_routing_policy(prompt: str, routing_policy: str) -> str:
+    """Prepend the EClaw central smart-routing policy when available.
+
+    Phase 4 of EClaw#2285. Server-managed; bridges fetch on first inbound
+    and cache the result. Fails open: empty policy returns prompt unchanged.
+    """
+    policy = (routing_policy or "").strip()
+    if not policy:
+        return prompt
+    return "\n".join([
+        "[EClaw central routing policy]",
+        policy,
+        "[End EClaw central routing policy]",
+        "",
+        prompt,
+    ])
+
+
+def derive_sender_hint(msg: dict) -> dict | None:
+    """Map an inbound webhook payload to a senderHint for /api/channel/message.
+
+    Mirrors the codex-eclaw-bridge implementation. The hint has the lowest
+    precedence on the server: explicit speakTo / broadcast and in-text
+    @-mentions still win. See EClaw#2285.
+
+    Mapping:
+      - isBroadcast → kind=broadcast
+      - from in {client,user,system,kanban} → kind=user (no routing)
+      - fromEntityId / fromPublicCode present → kind=entity
+      - otherwise → kind=unknown (server treats as no routing)
+    """
+    if msg.get("isBroadcast"):
+        return {"kind": "broadcast"}
+    from_key = (msg.get("from") or "").lower()
+    if from_key in {"client", "user", "system", "kanban"}:
+        return {"kind": "user"}
+    from_eid = msg.get("fromEntityId")
+    from_pc = msg.get("fromPublicCode")
+    if isinstance(from_eid, int) or isinstance(from_pc, str):
+        hint: dict = {"kind": "entity"}
+        if isinstance(from_eid, int):
+            hint["entityId"] = from_eid
+        if isinstance(from_pc, str) and from_pc:
+            hint["publicCode"] = from_pc
+        return hint
+    return {"kind": "unknown"}
+
+
 # --- EClaw API ------------------------------------------------------------
 
-async def send_message(session: ClientSession, text: str, state: str = "IDLE") -> dict:
-    """POST /api/channel/message — reply to the user on the user's wallpaper."""
-    body = {
+async def send_message(
+    session: ClientSession,
+    text: str,
+    state: str = "IDLE",
+    sender_hint: dict | None = None,
+) -> dict:
+    """POST /api/channel/message — reply to the user on the user's wallpaper.
+
+    Phase 4 of EClaw#2285: when sender_hint is provided, the EClaw server
+    resolves speakTo centrally, removing the need for the bridge to call the
+    deprecated /api/entity/speak-to endpoint as a follow-up.
+    """
+    body: dict = {
         "channel_api_key": API_KEY,
         "deviceId": DEVICE_ID,
         "entityId": ENTITY_ID,
@@ -102,6 +160,8 @@ async def send_message(session: ClientSession, text: str, state: str = "IDLE") -
         "message": text,
         "state": state,
     }
+    if sender_hint:
+        body["senderHint"] = sender_hint
     async with session.post(f"{API_BASE}/api/channel/message", json=body) as r:
         data = await r.json()
         if not data.get("success"):
@@ -109,19 +169,39 @@ async def send_message(session: ClientSession, text: str, state: str = "IDLE") -
         return data
 
 
-async def speak_to(session: ClientSession, to_entity_id: int, text: str, expects_reply: bool = False) -> None:
-    """POST /api/entity/speak-to — bot-to-bot reply."""
-    body = {
-        "deviceId": DEVICE_ID,
-        "fromEntityId": ENTITY_ID,
-        "botSecret": BOT_SECRET,
-        "toEntityId": to_entity_id,
-        "text": text,
-        "expects_reply": expects_reply,
-    }
-    async with session.post(f"{API_BASE}/api/entity/speak-to", json=body) as r:
-        if r.status >= 400:
-            log.error("speak_to %d failed: %s", to_entity_id, await r.text())
+# Cached once per process — the routing policy is static across messages and
+# sessions. Bridges restart cheaply; we don't refresh in-band.
+_routing_policy_cache: str | None = None
+
+
+async def fetch_routing_policy(session: ClientSession) -> str:
+    """GET /api/channel/routing-policy — central smart-routing system prompt.
+
+    EClaw#2285 Phase 4. Cached for the lifetime of the bridge process. Fails
+    open with "" so older servers (pre-EClaw#2287) or transient network
+    errors don't block message delivery.
+    """
+    global _routing_policy_cache
+    if _routing_policy_cache is not None:
+        return _routing_policy_cache
+    params = {"channel": "hermes", "lang": "en"}
+    try:
+        async with session.get(f"{API_BASE}/api/channel/routing-policy", params=params) as r:
+            if r.status >= 400:
+                _routing_policy_cache = ""
+                return ""
+            data = await r.json()
+    except Exception as e:  # noqa: BLE001
+        log.warning("routing policy fetch skipped: %s", e)
+        _routing_policy_cache = ""
+        return ""
+
+    if data.get("success") is False:
+        _routing_policy_cache = ""
+        return ""
+    policy = (data.get("policy") or "").strip()
+    _routing_policy_cache = policy
+    return policy
 
 
 async def fetch_prompt_policy(session: ClientSession) -> str:
@@ -431,8 +511,10 @@ async def process_message(msg: dict) -> None:
 
     async with ClientSession() as s:
         compiled_policy = await fetch_prompt_policy(s)
+        routing_policy = await fetch_routing_policy(s)
 
     prompt = apply_prompt_policy(prompt, compiled_policy)
+    prompt = apply_routing_policy(prompt, routing_policy)
 
     log.info("event=%s from=%s text=%r", event, from_entity_id or "user", text[:80])
     reply = await ask_hermes(prompt)
@@ -441,13 +523,13 @@ async def process_message(msg: dict) -> None:
         log.info("reply empty or silent — skip delivery")
         return
 
+    # EClaw#2285 Phase 4: derive senderHint from the inbound payload and pass
+    # it to /api/channel/message. The server resolves speakTo centrally, so
+    # we no longer need the dual send_message + speak_to path that previously
+    # leaned on the deprecated /api/entity/speak-to endpoint.
+    sender_hint = derive_sender_hint(msg)
     async with ClientSession() as s:
-        if event == "message":
-            await send_message(s, reply)
-        elif event in ("entity_message", "broadcast") and from_entity_id is not None:
-            # Per openclaw pattern: both update own wallpaper AND speak back
-            await send_message(s, reply)
-            await speak_to(s, from_entity_id, reply)
+        await send_message(s, reply, sender_hint=sender_hint)
 
 
 # --- Boot ----------------------------------------------------------------
