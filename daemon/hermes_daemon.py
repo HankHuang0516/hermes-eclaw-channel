@@ -96,7 +96,7 @@ async def _chat_json(req: web.Request, body: dict) -> web.Response:
         result = await _run_and_collect(body["prompt"], request_id)
     except hermes_worker.HermesError as e:
         log.warning("[hermes] %s rid=%s: %s", e.kind, request_id[:8], e.detail[:500])
-        status = {"timeout": 504, "spawn_failed": 503, "hermes_exit": 502}.get(e.kind, 500)
+        status = {"timeout": 504, "spawn_failed": 503, "hermes_exit": 502, "missing_github_pat": 503, "missing_tool": 503, "pr_flow_failed": 502}.get(e.kind, 500)
         return _err(e.kind, e.detail, status)
     return web.json_response({
         "ok": True,
