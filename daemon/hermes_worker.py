@@ -291,13 +291,31 @@ async def _run_pr_only_chat(prompt: str, timeout: int) -> HermesResult:
         ])
         result = await _run_chat_subprocess(pr_prompt, timeout=timeout, cwd=str(repo_dir), use_continue=False)
         status = _run(["git", "status", "--porcelain"], cwd=repo_dir, env=env).stdout.strip()
-        if not status:
+        ahead = int(_run(
+            ["git", "rev-list", "--count", f"origin/{PR_BASE_BRANCH}..HEAD"],
+            cwd=repo_dir, env=env,
+        ).stdout.strip() or "0")
+        # Hermes occasionally runs `git commit` itself despite the workspace
+        # preamble telling it not to. Detect both cases: dirty worktree
+        # (uncommitted) OR commits-ahead-of-base (Hermes self-committed).
+        # Without the rev-list check, a Hermes-self-committed branch looks
+        # clean → daemon returns no-PR → TemporaryDirectory cleanup destroys
+        # the commit.
+        if not status and ahead == 0:
             reply = result.reply or "Hermes completed, but produced no file diff; no PR was opened."
             return HermesResult(silent=result.silent, reply=reply, duration_ms=result.duration_ms)
 
-        _run(["git", "add", "-A"], cwd=repo_dir, env=env)
         commit_title = f"Hermes file edit: {slug}"
-        _run(["git", "commit", "-m", commit_title], cwd=repo_dir, env=env)
+        if status:
+            _run(["git", "add", "-A"], cwd=repo_dir, env=env)
+            _run(["git", "commit", "-m", commit_title], cwd=repo_dir, env=env)
+        else:
+            existing = _run(
+                ["git", "log", "-1", "--pretty=%s", "HEAD"],
+                cwd=repo_dir, env=env,
+            ).stdout.strip()
+            if existing:
+                commit_title = existing
         _run(["git", "push", "origin", branch], cwd=repo_dir, env=env, timeout=180)
         body = "\n".join([
             "Automated Hermes PR-only file-edit flow.",
