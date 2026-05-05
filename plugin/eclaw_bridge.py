@@ -71,6 +71,13 @@ DAEMON_CONNECT_TIMEOUT = float(os.environ.get("HERMES_DAEMON_CONNECT_TIMEOUT", "
 STALE_WEBHOOK_THRESHOLD_S = int(os.environ.get("HERMES_STALE_WEBHOOK_THRESHOLD_S", "300"))
 _BOOT_TS = time.time()
 
+# Phase 2: when True and API_KEY is set, send_message uses /api/transform
+# with X-Channel-Key header + actAs:"channel" instead of /api/channel/message.
+# Default False — existing deployments are unaffected.
+PREFER_TRANSFORM_VIA_CHANNEL_KEY = (
+    os.environ.get("HERMES_ECLAW_PREFER_TRANSFORM_VIA_CHANNEL_KEY", "").lower() == "true"
+)
+
 # Kept as a safety net — if Hermes still happens to output this exact token
 # (e.g. from system prompt or memory), skip the reply.
 SILENT_TOKEN = "[SILENT]"
@@ -146,27 +153,49 @@ async def send_message(
     state: str = "IDLE",
     sender_hint: dict | None = None,
 ) -> dict:
-    """POST /api/channel/message — reply to the user on the user's wallpaper.
+    """Send reply via whichever auth path is configured.
 
-    Phase 4 of EClaw#2285: when sender_hint is provided, the EClaw server
-    resolves speakTo centrally, removing the need for the bridge to call the
-    deprecated /api/entity/speak-to endpoint as a follow-up.
+    Phase 2: when HERMES_ECLAW_PREFER_TRANSFORM_VIA_CHANNEL_KEY=true and
+    API_KEY is set, posts to /api/transform with X-Channel-Key header +
+    actAs:"channel" — gaining @-mention auto-routing and A2A queue
+    side-effects without a per-entity botSecret in the bridge env.
+
+    Phase 4 of EClaw#2285 (senderHint) applies to both paths.
     """
-    body: dict = {
-        "channel_api_key": API_KEY,
-        "deviceId": DEVICE_ID,
-        "entityId": ENTITY_ID,
-        "botSecret": BOT_SECRET,
-        "message": text,
-        "state": state,
-    }
-    if sender_hint:
-        body["senderHint"] = sender_hint
-    async with session.post(f"{API_BASE}/api/channel/message", json=body) as r:
-        data = await r.json()
-        if not data.get("success"):
-            log.error("send_message failed: %s", data)
-        return data
+    if PREFER_TRANSFORM_VIA_CHANNEL_KEY and API_KEY:
+        # Phase 2: channel key path
+        body: dict = {
+            "deviceId": DEVICE_ID,
+            "entityId": ENTITY_ID,
+            "actAs": "channel",
+            "message": text,
+            "state": state,
+        }
+        if sender_hint:
+            body["senderHint"] = sender_hint
+        headers = {"X-Channel-Key": API_KEY}
+        async with session.post(f"{API_BASE}/api/transform", json=body, headers=headers) as r:
+            data = await r.json()
+            if not data.get("success"):
+                log.error("send_message via transform failed: %s", data)
+            return data
+    else:
+        # Default path: /api/channel/message (Phase 4 fallback)
+        body = {
+            "channel_api_key": API_KEY,
+            "deviceId": DEVICE_ID,
+            "entityId": ENTITY_ID,
+            "botSecret": BOT_SECRET,
+            "message": text,
+            "state": state,
+        }
+        if sender_hint:
+            body["senderHint"] = sender_hint
+        async with session.post(f"{API_BASE}/api/channel/message", json=body) as r:
+            data = await r.json()
+            if not data.get("success"):
+                log.error("send_message failed: %s", data)
+            return data
 
 
 # Cached once per process — the routing policy is static across messages and
