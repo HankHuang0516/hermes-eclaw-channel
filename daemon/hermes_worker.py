@@ -85,13 +85,41 @@ _PURE_RULE_RE = re.compile(r"^[\s─━│╭╮╰╯═]+$")
 
 _RICH_OPEN_BRACKET_RE = re.compile(r"\[")
 
+# Policy / FWD wrapper blocks EClaw stamps onto every channel inbound. These
+# pollute prompts (every chat is dressed up to look like an i18n PR ask) and —
+# critically — drove #142: the classifier matched `i18n` / `pull request` /
+# `.js` inside the *wrapper* and routed routine text replies through the
+# clone-and-PR flow, opening a fresh CRLF runaway PR on every reply.
+_POLICY_BLOCK_RES = (
+    re.compile(r"\[EClaw central routing policy\].*?\[End EClaw central routing policy\]", re.DOTALL),
+    re.compile(r"\[EClaw managed prompt policy[^\]]*\].*?\[End EClaw managed prompt policy\]", re.DOTALL),
+    re.compile(r"\[MENTIONS\s*[—-]\s*IMPORTANT ROUTING HINT\].*?(?=\n\[|\Z)", re.DOTALL),
+)
+_FWD_HEADER_RE = re.compile(r"^\[EClaw from [^\]]+\][^\n]*\n?", re.MULTILINE)
+_BOT_TO_BOT_HEADER_RE = re.compile(r"^\[Bot-to-Bot message from [^\]]+\][^\n]*\n?", re.MULTILINE)
+
+# Strong file-edit signals: explicit path mention OR explicit PR intent.
+# Bare keywords like `i18n`, `\bpr\b`, `\bedit\b` were chasing every chat
+# reply through the clone flow — see #142 root cause.
 _FILE_EDIT_RE = re.compile(
-    r"(\bedit\b|\bmodify\b|\bpatch\b|\bfix\b|\bupdate\b|\bcommit\b|\bpr\b|pull request|"
-    r"file-edit|翻譯|翻译|修復|修改|開出 PR|提 PR|backend/public/shared/i18n\.js|"
-    r"i18n|package\.json|\.py\b|\.js\b|\.ts\b|\.kt\b|\.html\b|\.css\b)",
+    r"("
+    # explicit relative paths
+    r"backend/public/shared/i18n\.js"
+    r"|backend/[^\s]+\.(?:js|ts|py|kt|html|css|json|md|sh)"
+    r"|frontend/[^\s]+\.(?:js|ts|py|kt|html|css|json|md|sh)"
+    r"|scripts?/[^\s]+\.(?:js|ts|py|kt|html|css|json|md|sh)"
+    r"|app/src/[^\s]+\.(?:js|ts|py|kt|html|css|json|md|sh)"
+    # explicit edit/PR intent in EN
+    r"|\bopen (?:a )?pull request\b|\bopen (?:a )?PR\b"
+    r"|\bsend (?:a )?pull request\b|\bsend (?:a )?PR\b"
+    r"|\bfile-edit\b"
+    # explicit edit/PR intent in zh
+    r"|開出 PR|提 PR|開 PR|送 PR|做出 PR"
+    r"|翻譯.*?i18n|翻译.*?i18n"
+    r")",
     re.IGNORECASE,
 )
-_TEXT_ONLY_RE = re.compile(r"\b(reply|answer|summari[sz]e|explain|translate only|只回覆|純文字)\b", re.IGNORECASE)
+_TEXT_ONLY_RE = re.compile(r"\b(reply|answer|summari[sz]e|explain|translate only|只回覆|純文字|status update|heartbeat|progress)\b", re.IGNORECASE)
 
 
 def strip_eclaw_context(text: str) -> str:
@@ -99,7 +127,22 @@ def strip_eclaw_context(text: str) -> str:
 
     Mirrors ``plugin/eclaw_bridge.py::_strip_eclaw_context``. Keep these in
     sync — divergence will desync prompts between daemon and fallback paths.
+
+    Strips, in order:
+    - ``[EClaw central routing policy]`` / ``[EClaw managed prompt policy …]``
+      wrapper blocks (the source of #142 — every channel reply was getting
+      routed through clone-and-PR because the classifier matched keywords
+      inside these blocks rather than in the user's actual prompt).
+    - ``[MENTIONS — IMPORTANT ROUTING HINT]`` mention table.
+    - ``[EClaw from entity:N:NAME]`` and ``[Bot-to-Bot message from Entity N (NAME)]``
+      single-line FWD headers.
+    - Legacy ``[Local Variables available: …]`` / ``[AVAILABLE TOOLS …]`` tails.
+    - ``[Quota: …]`` line (Hermes was way too willing to "[SILENT]").
     """
+    for block_re in _POLICY_BLOCK_RES:
+        text = block_re.sub("", text)
+    text = _FWD_HEADER_RE.sub("", text)
+    text = _BOT_TO_BOT_HEADER_RE.sub("", text)
     for marker in ("\n[Local Variables available:", "\n[AVAILABLE TOOLS"):
         idx = text.find(marker)
         if idx >= 0:
@@ -274,6 +317,21 @@ async def _run_pr_only_chat(prompt: str, timeout: int) -> HermesResult:
         repo_dir = tmpdir / "EClaw"
         log.info("[hermes-pr] cloning repo for file-edit task branch=%s slug=%s", branch, slug)
         _run(["git", "clone", "--depth", "1", "--branch", PR_BASE_BRANCH, PR_REPO_URL, str(repo_dir)], env=env, timeout=180)
+
+        # CRLF defense — #142.
+        # EClaw's .gitattributes mandates ``*.js text eol=lf`` but a number of
+        # legacy blobs are still committed with CRLF. A vanilla clone then
+        # checkout-normalises them, leaving 38+ files dirty in the working
+        # tree before Hermes touches anything — every "did Hermes change
+        # files?" check then returns yes and we ship a +15k/-15k CRLF
+        # runaway PR. Disable the per-attribute EOL filter for this clone
+        # (local-only override via .git/info/attributes — does not pollute
+        # the working tree's tracked .gitattributes) and re-checkout from
+        # the index so the working tree matches the committed bytes exactly.
+        (repo_dir / ".git" / "info").mkdir(parents=True, exist_ok=True)
+        (repo_dir / ".git" / "info" / "attributes").write_text("* -text\n", encoding="utf-8")
+        _run(["git", "checkout", "HEAD", "--", "."], cwd=repo_dir, env=env)
+
         _run(["git", "checkout", "-b", branch], cwd=repo_dir, env=env)
         _run(["git", "config", "user.name", "Hermes Bot"], cwd=repo_dir, env=env)
         _run(["git", "config", "user.email", "hermes-bot@users.noreply.github.com"], cwd=repo_dir, env=env)
@@ -304,6 +362,19 @@ async def _run_pr_only_chat(prompt: str, timeout: int) -> HermesResult:
         if not status and ahead == 0:
             reply = result.reply or "Hermes completed, but produced no file diff; no PR was opened."
             return HermesResult(silent=result.silent, reply=reply, duration_ms=result.duration_ms)
+
+        # Second guard: dirty-but-EOL-only working tree (belt-and-braces over
+        # the CRLF defense above). If every dirty file is whitespace/EOL noise,
+        # abort before commit so we don't ship another runaway PR.
+        if status and ahead == 0:
+            real_diff = _run(
+                ["git", "diff", "--shortstat", "--ignore-cr-at-eol", "--ignore-all-space"],
+                cwd=repo_dir, env=env,
+            ).stdout.strip()
+            if not real_diff:
+                log.warning("[hermes-pr] dirty worktree is EOL/whitespace-only; skipping PR")
+                reply = result.reply or "Hermes produced no semantic file changes (EOL/whitespace only); no PR was opened."
+                return HermesResult(silent=result.silent, reply=reply, duration_ms=result.duration_ms)
 
         commit_title = f"Hermes file edit: {slug}"
         if status:

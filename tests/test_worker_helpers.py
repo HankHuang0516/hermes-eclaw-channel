@@ -36,6 +36,11 @@ FIXTURES = [
     'foo\n[Quota: 5/10 remaining — output "[SILENT]" if nothing]\nbar',
     "\x1b[31mred\x1b[0m text",
     "─ ⚕ Hermes ─────\nfirst\n─ ⚕ Hermes ─────\nsecond\nSession: abc",
+    # #142 fixtures: policy + FWD wrapper blocks
+    "[EClaw central routing policy]\n routing details mentioning pull request and i18n.js\n[End EClaw central routing policy]\n\nuser body here",
+    "[EClaw managed prompt policy - claude_code]\npolicy body\n[End EClaw managed prompt policy]\n\nreal prompt",
+    "[EClaw from entity:1:LOBSTER] [Bot-to-Bot message from Entity 1 (LOBSTER)]\nreal payload",
+    "[MENTIONS — IMPORTANT ROUTING HINT]\n  @#5  Hermes\n  @00vt9i\n\nbody after mentions",
 ]
 
 

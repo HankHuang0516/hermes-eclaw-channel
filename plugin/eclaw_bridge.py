@@ -267,6 +267,16 @@ async def fetch_prompt_policy(session: ClientSession) -> str:
 _QUOTA_LINE_RE = re.compile(r"^\[Quota:.*$", re.MULTILINE)
 _RICH_OPEN_BRACKET_RE = re.compile(r"\[")
 
+# Policy / FWD wrapper blocks EClaw stamps onto every channel inbound. See
+# ``daemon/hermes_worker.py::strip_eclaw_context`` for rationale (#142).
+_POLICY_BLOCK_RES = (
+    re.compile(r"\[EClaw central routing policy\].*?\[End EClaw central routing policy\]", re.DOTALL),
+    re.compile(r"\[EClaw managed prompt policy[^\]]*\].*?\[End EClaw managed prompt policy\]", re.DOTALL),
+    re.compile(r"\[MENTIONS\s*[—-]\s*IMPORTANT ROUTING HINT\].*?(?=\n\[|\Z)", re.DOTALL),
+)
+_FWD_HEADER_RE = re.compile(r"^\[EClaw from [^\]]+\][^\n]*\n?", re.MULTILINE)
+_BOT_TO_BOT_HEADER_RE = re.compile(r"^\[Bot-to-Bot message from [^\]]+\][^\n]*\n?", re.MULTILINE)
+
 
 def _strip_eclaw_context(text: str) -> str:
     """Strip EClaw's auto-injected context blocks that pollute the prompt.
@@ -274,12 +284,25 @@ def _strip_eclaw_context(text: str) -> str:
     EClaw's server prepends/appends several things that are either redundant
     or actively harmful for Hermes:
 
-      - ``[Local Variables available: ...]`` / ``[AVAILABLE TOOLS ...]`` —
-        meant for OpenClaw bots; noise for us.
+      - ``[EClaw central routing policy]`` / ``[EClaw managed prompt policy …]``
+        wrapper blocks — the source of #142. The policy block names
+        ``backend/public/shared/i18n.js`` / ``pull request`` / ``.js`` in its
+        own body; leaving it in the prompt drove the file-edit classifier
+        to fire on every chat reply.
+      - ``[MENTIONS — IMPORTANT ROUTING HINT]`` mention table — useless once
+        routing is resolved.
+      - ``[EClaw from entity:N:NAME]`` / ``[Bot-to-Bot message from …]`` FWD
+        headers — bridge-internal metadata.
+      - Legacy ``[Local Variables available: ...]`` / ``[AVAILABLE TOOLS ...]``
+        — meant for OpenClaw bots; noise for us.
       - ``[Quota: N/M bot-to-bot remaining — output "[SILENT]" if
         nothing worth replying]`` — the instruction Hermes is way too
         willing to comply with, causing false silent skips.
     """
+    for block_re in _POLICY_BLOCK_RES:
+        text = block_re.sub("", text)
+    text = _FWD_HEADER_RE.sub("", text)
+    text = _BOT_TO_BOT_HEADER_RE.sub("", text)
     for marker in ("\n[Local Variables available:", "\n[AVAILABLE TOOLS"):
         idx = text.find(marker)
         if idx >= 0:
