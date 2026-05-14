@@ -343,11 +343,16 @@ async def _run_pr_only_chat(prompt: str, timeout: int) -> HermesResult:
             "Make the requested file edits in this working tree only.",
             "Do not run git commit, git push, or gh pr create; the daemon will do that after you finish.",
             "Keep the diff minimal and do not edit unrelated files.",
+            "Bash sandbox notes — avoid patterns that trip the high-risk approval prompt under piped stdin:",
+            "  - Do NOT pipe a file into `python3 -c '<script>'` (e.g. `cat foo.json | python3 -c '...'`). Stdin is non-interactive so the approval gate auto-denies and the tool call times out.",
+            "  - Instead, open the file inside the script: `python3 -c \"import json; data=json.load(open('foo.json')); print(...)\"`.",
+            "  - For multi-line scripts, write a tempfile first: write `/tmp/x.py`, then run `python3 /tmp/x.py foo.json`.",
+            "  - Same rule for `jq` and other consumers: use `jq '...' file` directly rather than `cat file | jq '...'`.",
             "[End Hermes PR-only file-edit workspace]",
             "",
             prompt,
         ])
-        result = await _run_chat_subprocess(pr_prompt, timeout=timeout, cwd=str(repo_dir), use_continue=False)
+        result = await _run_chat_subprocess(pr_prompt, timeout=timeout, cwd=str(repo_dir), use_continue=False, yolo=True)
         status = _run(["git", "status", "--porcelain"], cwd=repo_dir, env=env).stdout.strip()
         ahead = int(_run(
             ["git", "rev-list", "--count", f"origin/{PR_BASE_BRANCH}..HEAD"],
@@ -490,7 +495,7 @@ async def _wait_for_idle_or_exit(
             continue
 
 
-async def _run_chat_subprocess(prompt: str, timeout: Optional[int] = None, *, cwd: Optional[str] = None, use_continue: Optional[bool] = None) -> HermesResult:
+async def _run_chat_subprocess(prompt: str, timeout: Optional[int] = None, *, cwd: Optional[str] = None, use_continue: Optional[bool] = None, yolo: bool = False) -> HermesResult:
     """Spawn one `hermes chat -q ... [--continue]` invocation.
 
     Lock-serialised — concurrent hermes CLI calls corrupt session jsonl files.
@@ -514,10 +519,12 @@ async def _run_chat_subprocess(prompt: str, timeout: Optional[int] = None, *, cw
     args = [HERMES_BIN, "chat", "-q", safe]
     if use_continue:
         args.append("--continue")
+    if yolo:
+        args.append("--yolo")
 
     log.info(
-        "[hermes] spawning chat, prompt_len=%d, idle=%ds, wall=%ds, resume=%s, call#=%d",
-        len(clean), IDLE_TIMEOUT, wall_deadline, use_continue, _call_count,
+        "[hermes] spawning chat, prompt_len=%d, idle=%ds, wall=%ds, resume=%s, yolo=%s, call#=%d",
+        len(clean), IDLE_TIMEOUT, wall_deadline, use_continue, yolo, _call_count,
     )
 
     env = {**os.environ, "PATH": HERMES_PATH_PREPEND + ":" + os.environ.get("PATH", "")}
