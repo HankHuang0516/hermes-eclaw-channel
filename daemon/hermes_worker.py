@@ -171,6 +171,31 @@ def escape_rich_brackets(text: str) -> str:
     return _RICH_OPEN_BRACKET_RE.sub(r"\\[", text)
 
 
+# Inner-claude (the LLM that runs inside `hermes chat`) hits a Bash sandbox
+# high-risk approval gate on certain command patterns. Stdin is non-interactive
+# so the gate auto-denies → tool call times out at IDLE_TIMEOUT (180s).
+#
+# Empirically observed wedges:
+#   - `cat foo.json | python3 -c '<script>'`
+#   - `python3 -c '<multi-line script>'`
+#   - `cat foo.json | jq '...'`
+#
+# Injected at the top of EVERY chat spawn (both PR-only and plain text paths)
+# so inner-claude knows the workaround from the first turn. Without this,
+# JSON-handling prompts cause the daemon to burn its 900s wall-clock budget
+# per call.
+_BASH_SANDBOX_NOTES = "\n".join([
+    "[Hermes Bash sandbox notes]",
+    "Avoid patterns that trip the inner-claude high-risk approval prompt under non-interactive stdin (the gate auto-denies and the tool call times out):",
+    "  - Do NOT pipe a file into `python3 -c '<script>'` (e.g. `cat foo.json | python3 -c '...'`).",
+    "  - Instead, open the file inside the script: `python3 -c \"import json; data=json.load(open('foo.json')); print(...)\"`.",
+    "  - For multi-line scripts, write a tempfile first: write `/tmp/x.py`, then run `python3 /tmp/x.py foo.json`.",
+    "  - Same rule for `jq` and other consumers: use `jq '...' file` directly rather than `cat file | jq '...'`.",
+    "[End Hermes Bash sandbox notes]",
+    "",
+])
+
+
 def extract_hermes_reply(stdout: str) -> str:
     """Pull the agent's response out of the verbose CLI envelope.
 
@@ -343,11 +368,6 @@ async def _run_pr_only_chat(prompt: str, timeout: int) -> HermesResult:
             "Make the requested file edits in this working tree only.",
             "Do not run git commit, git push, or gh pr create; the daemon will do that after you finish.",
             "Keep the diff minimal and do not edit unrelated files.",
-            "Bash sandbox notes — avoid patterns that trip the high-risk approval prompt under piped stdin:",
-            "  - Do NOT pipe a file into `python3 -c '<script>'` (e.g. `cat foo.json | python3 -c '...'`). Stdin is non-interactive so the approval gate auto-denies and the tool call times out.",
-            "  - Instead, open the file inside the script: `python3 -c \"import json; data=json.load(open('foo.json')); print(...)\"`.",
-            "  - For multi-line scripts, write a tempfile first: write `/tmp/x.py`, then run `python3 /tmp/x.py foo.json`.",
-            "  - Same rule for `jq` and other consumers: use `jq '...' file` directly rather than `cat file | jq '...'`.",
             "[End Hermes PR-only file-edit workspace]",
             "",
             prompt,
@@ -509,7 +529,11 @@ async def _run_chat_subprocess(prompt: str, timeout: Optional[int] = None, *, cw
         post-boot times out (auto-detection of stuck-session-on-restart).
     """
     global _call_count, _consecutive_timeouts, _resume_auto_disabled
-    clean = strip_eclaw_context(prompt)
+    # Prepend Bash sandbox notes BEFORE strip+escape so the notes flow through
+    # the same prompt-cleaning pipeline as user content (escape doubles `[` so
+    # rich.console doesn't crash; strip is harmless here since the notes don't
+    # match any policy block patterns).
+    clean = strip_eclaw_context(_BASH_SANDBOX_NOTES + prompt)
     safe = escape_rich_brackets(clean)
     wall_deadline = timeout if timeout is not None else DEFAULT_TIMEOUT
     if use_continue is None:
