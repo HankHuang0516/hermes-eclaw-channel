@@ -141,7 +141,7 @@ Shared bearer token: `Authorization: Bearer <HERMES_DAEMON_TOKEN>`.
 |----------------|------------------|------------------------------------------------------------------|------------------------------------|
 | `bad_request`  | 400              | Missing `prompt` / `request_id`, malformed JSON.                | Log + drop (don't retry).          |
 | `unauthorized` | 401              | Bearer mismatch.                                                | Log + escalate (config bug).       |
-| `busy`         | 503              | Queue depth exceeds `HERMES_DAEMON_QUEUE_MAX` (default 8). Phase H1: was 429 — switched to 503 per vLLM RFC #18826 backpressure (429 implies "retry now" which sustains overload). | Fall back to subprocess.           |
+| `busy`         | 503              | Queue depth exceeds `HERMES_DAEMON_QUEUE_MAX` (default 8). Phase H1: was 429 — switched to 503 per vLLM RFC #18826 backpressure (429 implies "retry now" which sustains overload). | Exponential backoff retry; if still busy, return a busy message without bypassing the queue. |
 | `timeout`      | 504              | Phase H1: idle-activity (no stdout chunk for `HERMES_IDLE_TIMEOUT_SECS`, default 60) **or** wall-clock (`HERMES_DAEMON_CHAT_TIMEOUT_SECS`, default 900). `detail` is `idle for Ns` or `wall-clock Ns`. | Return `[Hermes 回應超時]` to user. |
 | `spawn_failed` | 503              | Worker process couldn't start.                                   | Fall back to subprocess.           |
 | `hermes_exit`  | 502              | Worker exited non-zero.                                          | Return `[Hermes 回覆失敗 — 請查 log]`. |
@@ -246,6 +246,13 @@ sensible defaults match the v0 contract.
 | `HERMES_NO_RESUME` | `""` (off) | When `1`/`true`/`yes`, daemon never passes `--continue` to hermes. Manual kill switch for stuck sessions. Auto-engaged for the daemon's lifetime once consecutive `--continue` timeouts cross `MAX_CONSECUTIVE_TIMEOUTS`. |
 | `HERMES_DAEMON_QUEUE_MAX` | `8` | When queue depth ≥ this, return `503 busy` (was `429` in v0). |
 | `HERMES_STALE_WEBHOOK_THRESHOLD_S` | `300` | Bridge drops EClaw webhook deliveries whose `timestamp` is older than this many seconds; mitigates startup-flood-of-stale-messages re-triggering the same wedge. |
+| `HERMES_DAEMON_BUSY_RETRIES` | `3` | Bridge retries daemon `busy` responses this many times before returning `[Hermes 忙碌中 — 請稍後再試]`. |
+| `HERMES_DAEMON_BUSY_BACKOFF_BASE_S` | `1` | First daemon busy retry delay; later retries double up to the max. |
+| `HERMES_DAEMON_BUSY_BACKOFF_MAX_S` | `10` | Cap for daemon busy exponential backoff. |
+| `HERMES_ECLAW_API_RATE_LIMIT_PER_MIN` | `30` | Local bridge limiter for EClaw delivery endpoints (`/api/transform` or `/api/channel/message`). Set `0` to disable. |
+| `HERMES_ECLAW_API_BACKOFF_RETRIES` | `3` | Retries EClaw delivery responses with HTTP `429` or `503`, honoring `Retry-After` when present. |
+| `HERMES_ECLAW_API_BACKOFF_BASE_S` | `1` | First EClaw delivery retry delay; later retries double up to the max. |
+| `HERMES_ECLAW_API_BACKOFF_MAX_S` | `30` | Cap for EClaw delivery exponential backoff and `Retry-After` waits. |
 
 ## 9. Open questions for review
 

@@ -18,6 +18,27 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 
+_BRIDGE_ENV_KEYS = (
+    "HERMES_ECLAW_API_KEY",
+    "HERMES_ECLAW_DEVICE_ID",
+    "HERMES_ECLAW_ENTITY_ID",
+    "HERMES_ECLAW_BOT_SECRET",
+    "HERMES_ECLAW_CALLBACK_TOKEN",
+    "HERMES_ECLAW_PREFER_TRANSFORM_VIA_CHANNEL_KEY",
+)
+
+
+@pytest.fixture(autouse=True)
+def _restore_bridge_env():
+    old_env = {k: os.environ.get(k) for k in _BRIDGE_ENV_KEYS}
+    yield
+    for k, v in old_env.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+
+
 def _ensure_bridge_env(api_key: str = "eck_testkey"):
     os.environ["HERMES_ECLAW_API_KEY"] = api_key
     os.environ["HERMES_ECLAW_DEVICE_ID"] = "dev-uuid"
@@ -153,3 +174,66 @@ async def test_send_message_falls_back_when_api_key_empty():
         assert captured["path"] == "/api/channel/message"
     finally:
         await server.close()
+
+
+@pytest.mark.asyncio
+async def test_send_message_retries_eclaw_429_with_retry_after(monkeypatch):
+    """EClaw delivery back-pressure should retry instead of dropping a reply."""
+    bridge = _reload_bridge(prefer_channel_key=True)
+    sleeps = []
+
+    async def fake_sleep(delay_s):
+        sleeps.append(delay_s)
+
+    monkeypatch.setattr(bridge, "_sleep", fake_sleep)
+    calls = {"n": 0}
+
+    async def handler(req):
+        calls["n"] += 1
+        await req.json()
+        if calls["n"] == 1:
+            return web.json_response(
+                {"success": False, "error": "rate limit"},
+                status=429,
+                headers={"Retry-After": "2.5"},
+            )
+        return web.json_response({"success": True})
+
+    app = web.Application()
+    app.router.add_post("/api/transform", handler)
+    server = TestServer(app)
+    await server.start_server()
+    try:
+        bridge.API_BASE = str(server.make_url("")).rstrip("/")
+        async with ClientSession() as s:
+            data = await bridge.send_message(s, "retry me")
+
+        assert data == {"success": True}
+        assert calls["n"] == 2
+        assert sleeps == [2.5]
+    finally:
+        await server.close()
+
+
+@pytest.mark.asyncio
+async def test_eclaw_rate_limiter_waits_after_window_capacity():
+    bridge = _reload_bridge(prefer_channel_key=True)
+    now = [0.0]
+    sleeps = []
+
+    async def fake_sleep(delay_s):
+        sleeps.append(delay_s)
+        now[0] += delay_s
+
+    limiter = bridge._SlidingWindowRateLimiter(
+        2,
+        window_s=60.0,
+        clock=lambda: now[0],
+        sleep=fake_sleep,
+    )
+
+    await limiter.acquire()
+    await limiter.acquire()
+    await limiter.acquire()
+
+    assert sleeps == [60.0]

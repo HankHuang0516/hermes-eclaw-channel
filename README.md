@@ -45,6 +45,10 @@ Bridge [Hermes Agent](https://github.com/NousResearch/hermes-agent) (NousResearc
 >
 > See [`docs/API-bridge-http-daemon.md`](./docs/API-bridge-http-daemon.md) for
 > endpoint surface, SSE event types, and fallback semantics.
+>
+> **H1 guardrail:** bridge delivery to EClaw is locally capped at 30 req/min
+> and retries EClaw `429`/`503` back-pressure with exponential backoff. Daemon
+> `busy` responses also back off instead of bypassing the worker queue.
 
 ---
 
