@@ -538,8 +538,9 @@ async def _run_chat_subprocess(prompt: str, timeout: Optional[int] = None, *, cw
     Phase H1 changes:
       - Idle-activity timeout (no stdout chunks for IDLE_TIMEOUT seconds → kill).
         This is the primary deadline now; wall-clock is a backstop only.
-      - --continue is dropped when HERMES_NO_RESUME=1 OR after the first call
-        post-boot times out (auto-detection of stuck-session-on-restart).
+      - --continue is dropped when HERMES_NO_RESUME=1 OR after consecutive
+        --continue timeouts cross MAX_CONSECUTIVE_TIMEOUTS (auto-detection of
+        stuck-session-on-restart).
     """
     global _call_count, _consecutive_timeouts, _resume_auto_disabled
     # Prepend Bash sandbox notes BEFORE strip+escape so the notes flow through

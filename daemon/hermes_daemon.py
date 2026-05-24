@@ -56,8 +56,8 @@ async def health(_: web.Request) -> web.Response:
     uptime_s = int(time.time() - _state["started_at"])
     # Surface Phase H1 worker state — Docker HEALTHCHECK + autoheal sidecar
     # read this; if `resume_auto_disabled=true` while in_flight=0 and
-    # queue_depth=0, the daemon is alive but on degraded mode (started fresh
-    # because session resume tripped on first call after boot).
+    # queue_depth=0, the daemon is alive but in degraded mode because repeated
+    # session-resume calls hit the timeout threshold.
     return web.json_response({
         "status": "ok",
         "service": "hermes-daemon",
