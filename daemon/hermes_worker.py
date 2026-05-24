@@ -465,6 +465,19 @@ async def run_chat(prompt: str, timeout: Optional[int] = None) -> HermesResult:
     return await _run_chat_subprocess(clean, timeout=wall_deadline)
 
 
+async def run_subprocess_chat(prompt: str, timeout: Optional[int] = None) -> HermesResult:
+    """Run the legacy direct subprocess path with the shared H1 safeguards.
+
+    Used by ``plugin/eclaw_bridge.py`` only when the HTTP daemon is disabled
+    or unreachable. It deliberately bypasses PR-only clone routing so fallback
+    preserves the old "ask Hermes directly" behaviour while still sharing the
+    idle-timeout, no-resume fuse, bash-sandbox preamble, and diagnostics.
+    """
+    clean = strip_eclaw_context(prompt)
+    wall_deadline = timeout if timeout is not None else DEFAULT_TIMEOUT
+    return await _run_chat_subprocess(clean, timeout=wall_deadline)
+
+
 async def _drain_stream(stream: asyncio.StreamReader, sink: list, last_activity: list) -> None:
     """Read chunks from a subprocess pipe, append to sink, bump last_activity.
 

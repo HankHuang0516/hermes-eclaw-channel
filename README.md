@@ -40,7 +40,8 @@ Bridge [Hermes Agent](https://github.com/NousResearch/hermes-agent) (NousResearc
 > loopback HTTP + SSE. Daemon owns one persistent `hermes --continue` child, so
 > cold start cost is paid once at boot, not per message. If `HERMES_DAEMON_URL`
 > is unset or the daemon is unreachable, the bridge automatically falls back
-> to the legacy per-request `hermes chat` subprocess — zero-risk migration.
+> to the per-request `hermes chat` subprocess through the same H1 worker wrapper
+> (idle timeout, no-resume fuse, diagnostics) — zero-risk migration.
 >
 > See [`docs/API-bridge-http-daemon.md`](./docs/API-bridge-http-daemon.md) for
 > endpoint surface, SSE event types, and fallback semantics.
@@ -111,7 +112,7 @@ Once running, anyone who messages the bot (via EClaw app or `https://eclawbot.co
 3. **Keychain is host-only** — for CI/prod need to switch to env file or a secret manager.
 
 > **Historical (resolved by daemon refactor 2026-04-28):**
-> - ~~Cold start ~7-9s per message~~ — daemon's persistent child pays this once at boot. Per-message latency now ≈ Hermes inference time only. Subprocess fallback path keeps the old behaviour when daemon is unreachable.
+> - ~~Cold start ~7-9s per message~~ — daemon's persistent child pays this once at boot. Per-message latency now ≈ Hermes inference time only. Subprocess fallback still cold-starts when daemon is unreachable, but it now shares the H1 worker safeguards.
 > - ~~Bridge-level `asyncio.Lock` serialises Hermes calls~~ — lock moved into the daemon's worker queue; the bridge itself can fan out.
 
 ---

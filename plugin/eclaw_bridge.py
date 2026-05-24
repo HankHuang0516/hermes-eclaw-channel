@@ -32,7 +32,6 @@ import json
 import logging
 import os
 import re
-import subprocess
 import textwrap
 import time
 import uuid
@@ -361,11 +360,6 @@ def _extract_hermes_reply(stdout: str) -> str:
     text = textwrap.dedent("\n".join(cleaned)).strip()
     return re.sub(r"\n{3,}", "\n\n", text)
 
-# Serialise Hermes calls — each spawn writes to ~/.hermes/sessions and
-# concurrent hermes CLI processes can corrupt session state.
-_hermes_lock = asyncio.Lock()
-
-
 class _DaemonUnavailable(Exception):
     """Daemon couldn't be reached — caller should fall back to subprocess."""
 
@@ -433,63 +427,22 @@ async def ask_hermes(prompt: str) -> str:
 
 
 async def _ask_hermes_subprocess(prompt: str) -> str:
-    """
-    呼叫 Hermes CLI，回 stdout（quiet mode：只剩最終回覆）。
+    """Direct Hermes subprocess fallback when the HTTP daemon is unavailable."""
+    from daemon import hermes_worker
 
-    加 timeout 保護：容器裡 PID 1 不 reap child，subprocess 若異常退出
-    可能變 zombie 導致 communicate() 永遠不返回。timeout 兜底。
-
-    Legacy path. Used directly when HERMES_DAEMON_URL is unset, and as a
-    fallback when the daemon is unreachable.
-    """
-    clean = _strip_eclaw_context(prompt)
-    safe = _escape_rich_brackets(clean)
-    log.info("[hermes] spawning chat, prompt_len=%d", len(clean))
-
-    # --continue reuses the most recent session → agent retains conversation
-    # memory across calls even though each spawn is a fresh process.
-    # -Q (quiet) deliberately omitted so tool-call previews and streaming
-    # deltas land in stdout, giving the bridge progress signal it can
-    # mid-task forward (also feeds ANSI-stripped output to EClaw chat).
-    args = [
-        "/home/node/hermes-agent/.venv/bin/hermes",  # skip `uv run` overhead
-        "chat", "-q", safe, "--continue",
-    ]
-
-    async with _hermes_lock:  # serialize to protect session files
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *args,
-                cwd="/home/node/hermes-agent",
-                env={**os.environ, "PATH": "/home/node/.local/bin:" + os.environ.get("PATH", "")},
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-        except Exception as e:
-            log.error("[hermes] failed to spawn: %s", e)
+    try:
+        result = await hermes_worker.run_subprocess_chat(prompt, timeout=HERMES_TIMEOUT)
+    except hermes_worker.HermesError as e:
+        log.warning("[hermes] subprocess %s: %s", e.kind, e.detail[:500])
+        if e.kind == "spawn_failed":
             return "[Hermes 啟動失敗]"
-
-        try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=HERMES_TIMEOUT)
-        except asyncio.TimeoutError:
-            log.error("[hermes] timed out after %ds", HERMES_TIMEOUT)
-            try:
-                proc.kill()
-                await proc.wait()
-            except Exception:
-                pass
+        if e.kind == "timeout":
             return "[Hermes 回應超時]"
-
-    if proc.returncode != 0:
-        # 4000-char cap: prior 500-char limit truncated mid-traceback and
-        # hid the rich.MarkupError crash that motivated this very escape.
-        log.error("[hermes] exit %d: %s", proc.returncode, stderr.decode()[:4000])
         return "[Hermes 回覆失敗 — 請查 log]"
 
-    raw = _ANSI_RE.sub("", stdout.decode())
-    reply = _extract_hermes_reply(raw)
-    log.info("[hermes] reply_len=%d", len(reply))
-    return reply
+    if result.silent:
+        return SILENT_TOKEN
+    return result.reply
 
 
 

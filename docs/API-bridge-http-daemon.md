@@ -178,6 +178,10 @@ Rules for the shim:
 4. **Output equivalence**: daemon returns the same body the bridge currently
    gets out of `_extract_hermes_reply()`. The daemon owns the envelope-stripping
    regexes — the bridge does not parse Hermes output in daemon-mode.
+5. **Shared fallback guardrails.** The direct subprocess fallback calls
+   `hermes_worker.run_subprocess_chat()`, not its own `proc.communicate()`
+   implementation, so daemon-down mode keeps the H1 idle-timeout,
+   no-resume fuse, bash-sandbox preamble, and timeout diagnostics.
 
 ## 6. Invariants the daemon MUST preserve
 
