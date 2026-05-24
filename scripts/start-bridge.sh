@@ -25,8 +25,12 @@ BOT_SECRET=$(security find-generic-password -s "hermes-eclaw-botsecret" -a "hank
 # Stop Hermes webhook gateway if it's holding 8644 (bridge will take over)
 docker exec openclaw-project-b bash -lc "pgrep -f 'hermes gateway run' | xargs -r kill 2>/dev/null || true; sleep 1" || true
 
-# Copy bridge script into container
+# Copy bridge script + shared worker package into container. The bridge's
+# daemon-down subprocess fallback imports daemon.hermes_worker for H1
+# safeguards even on this deprecated launcher path.
+docker exec openclaw-project-b bash -lc "rm -rf /tmp/daemon"
 docker cp plugin/eclaw_bridge.py openclaw-project-b:/tmp/eclaw_bridge.py
+docker cp daemon openclaw-project-b:/tmp/daemon
 
 # Kill any previous bridge
 docker exec openclaw-project-b bash -lc "pgrep -f eclaw_bridge | xargs -r kill 2>/dev/null || true; sleep 1" || true
@@ -41,6 +45,7 @@ export HERMES_ECLAW_BOT_SECRET='$BOT_SECRET'
 export HERMES_ECLAW_API_BASE='$HERMES_ECLAW_API_BASE'
 export HERMES_ECLAW_CALLBACK_TOKEN='$HERMES_ECLAW_CALLBACK_TOKEN'
 export HERMES_PORT='8644'
+export PYTHONPATH=/tmp:\${PYTHONPATH:-}
 cd /home/node/hermes-agent
 nohup .venv/bin/python3 /tmp/eclaw_bridge.py > /tmp/eclaw-bridge.log 2>&1 &
 "

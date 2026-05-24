@@ -173,3 +173,42 @@ async def test_no_daemon_url_uses_subprocess(monkeypatch):
     reply = await bridge.ask_hermes("hi")
     assert reply == "legacy"
     assert called["n"] == 1
+
+
+async def test_subprocess_fallback_uses_shared_worker(monkeypatch):
+    """Fallback must share daemon worker H1 safeguards, not duplicate legacy proc code."""
+    _ensure_bridge_env()
+    bridge = _reload_bridge()
+    from daemon import hermes_worker  # noqa: WPS433
+
+    calls = {}
+
+    async def fake_run(prompt, timeout=None):
+        calls["prompt"] = prompt
+        calls["timeout"] = timeout
+        return hermes_worker.HermesResult(silent=False, reply="shared worker", duration_ms=12)
+
+    monkeypatch.setattr(hermes_worker, "run_subprocess_chat", fake_run)
+
+    reply = await bridge._ask_hermes_subprocess("raw prompt")
+
+    assert reply == "shared worker"
+    assert calls == {"prompt": "raw prompt", "timeout": bridge.HERMES_TIMEOUT}
+
+
+@pytest.mark.parametrize("kind,expected", [
+    ("spawn_failed", "[Hermes 啟動失敗]"),
+    ("timeout", "[Hermes 回應超時]"),
+    ("hermes_exit", "[Hermes 回覆失敗 — 請查 log]"),
+])
+async def test_subprocess_fallback_maps_shared_worker_errors(monkeypatch, kind, expected):
+    _ensure_bridge_env()
+    bridge = _reload_bridge()
+    from daemon import hermes_worker  # noqa: WPS433
+
+    async def fake_run(prompt, timeout=None):
+        raise hermes_worker.HermesError(kind, "detail")
+
+    monkeypatch.setattr(hermes_worker, "run_subprocess_chat", fake_run)
+
+    assert await bridge._ask_hermes_subprocess("hi") == expected
