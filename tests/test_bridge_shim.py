@@ -141,6 +141,85 @@ async def test_daemon_503_falls_back(monkeypatch):
         await server.close()
 
 
+async def test_daemon_busy_retries_with_exponential_backoff(monkeypatch):
+    _ensure_bridge_env()
+    monkeypatch.setenv("HERMES_DAEMON_BUSY_RETRIES", "2")
+    monkeypatch.setenv("HERMES_DAEMON_BUSY_BACKOFF_BASE_S", "0.5")
+    monkeypatch.setenv("HERMES_DAEMON_BUSY_BACKOFF_MAX_S", "10")
+
+    calls = {"n": 0}
+
+    async def chat(req):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            return web.json_response(
+                {"ok": False, "error": {"kind": "busy", "detail": "queue full"}},
+                status=503,
+            )
+        return web.json_response({"ok": True, "reply": "after backoff", "silent": False, "duration_ms": 5})
+
+    server = await _mock_daemon(chat)
+    try:
+        url = f"http://{server.host}:{server.port}"
+        monkeypatch.setenv("HERMES_DAEMON_URL", url)
+        bridge = _reload_bridge()
+        sleeps = []
+
+        async def fake_sleep(delay_s):
+            sleeps.append(delay_s)
+
+        monkeypatch.setattr(bridge, "_sleep", fake_sleep)
+
+        async def boom(prompt):
+            raise AssertionError("busy back-pressure should not bypass to subprocess")
+        monkeypatch.setattr(bridge, "_ask_hermes_subprocess", boom)
+
+        reply = await bridge.ask_hermes("hi")
+        assert reply == "after backoff"
+        assert calls["n"] == 3
+        assert sleeps == [0.5, 1.0]
+    finally:
+        await server.close()
+
+
+async def test_daemon_busy_exhaustion_does_not_fallback(monkeypatch):
+    _ensure_bridge_env()
+    monkeypatch.setenv("HERMES_DAEMON_BUSY_RETRIES", "1")
+    monkeypatch.setenv("HERMES_DAEMON_BUSY_BACKOFF_BASE_S", "0.25")
+
+    calls = {"n": 0}
+
+    async def chat(req):
+        calls["n"] += 1
+        return web.json_response(
+            {"ok": False, "error": {"kind": "busy", "detail": "queue full"}},
+            status=503,
+        )
+
+    server = await _mock_daemon(chat)
+    try:
+        url = f"http://{server.host}:{server.port}"
+        monkeypatch.setenv("HERMES_DAEMON_URL", url)
+        bridge = _reload_bridge()
+        sleeps = []
+
+        async def fake_sleep(delay_s):
+            sleeps.append(delay_s)
+
+        monkeypatch.setattr(bridge, "_sleep", fake_sleep)
+
+        async def boom(prompt):
+            raise AssertionError("busy exhaustion should not fall back to subprocess")
+        monkeypatch.setattr(bridge, "_ask_hermes_subprocess", boom)
+
+        reply = await bridge.ask_hermes("hi")
+        assert reply == "[Hermes 忙碌中 — 請稍後再試]"
+        assert calls["n"] == 2
+        assert sleeps == [0.25]
+    finally:
+        await server.close()
+
+
 async def test_daemon_silent_returns_silent_token(monkeypatch):
     _ensure_bridge_env()
 
