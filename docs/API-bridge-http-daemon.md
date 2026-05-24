@@ -110,9 +110,9 @@ exec'ing into the container:
 
 - `calls_total` — monotonic counter; jumps + queue_depth=0 + in_flight=0
   means the daemon is healthy and processing.
-- `resume_auto_disabled` — `true` once the first call after boot timed out
-  with `--continue` (NousResearch issue #7536 mitigation). Stays on for the
-  daemon's lifetime; restart re-evaluates.
+- `resume_auto_disabled` — `true` once consecutive `--continue` calls cross
+  `MAX_CONSECUTIVE_TIMEOUTS` timeouts (NousResearch issue #7536 mitigation).
+  Stays on for the daemon's lifetime; restart re-evaluates.
 - `no_resume_env` — reflects `HERMES_NO_RESUME` env (manual kill switch).
 - `idle_timeout_s` / `wall_timeout_s` — the two deadlines (idle is primary,
   wall is backstop).
@@ -190,7 +190,8 @@ daemon implementation cannot break any of them:
 
 1. **Session continuity is best-effort, not guaranteed.** v0 used `--continue`
    unconditionally. **Phase H1**: `--continue` drops on `HERMES_NO_RESUME=1`
-   *or* once the first call after boot times out (issue #7536 mitigation).
+   *or* after consecutive `--continue` calls cross the timeout threshold
+   (issue #7536 mitigation).
    Bridge MUST NOT depend on Hermes remembering prior context across daemon
    restarts. `_hermes_lock` still serialises all CLI spawns from the daemon.
 2. **`[SILENT]` short-circuit.** If the extracted reply contains the literal
@@ -242,7 +243,7 @@ sensible defaults match the v0 contract.
 |-----|---------|---------|
 | `HERMES_IDLE_TIMEOUT_SECS` | `60` | Kill subprocess if no stdout chunk arrives for this many seconds. Primary deadline. |
 | `HERMES_DAEMON_CHAT_TIMEOUT_SECS` | `900` | Wall-clock backstop. Was the only deadline in v0. |
-| `HERMES_NO_RESUME` | `""` (off) | When `1`/`true`/`yes`, daemon never passes `--continue` to hermes. Manual kill switch for stuck sessions. Auto-engaged for the daemon's lifetime if first call after boot times out with `--continue`. |
+| `HERMES_NO_RESUME` | `""` (off) | When `1`/`true`/`yes`, daemon never passes `--continue` to hermes. Manual kill switch for stuck sessions. Auto-engaged for the daemon's lifetime once consecutive `--continue` timeouts cross `MAX_CONSECUTIVE_TIMEOUTS`. |
 | `HERMES_DAEMON_QUEUE_MAX` | `8` | When queue depth ≥ this, return `503 busy` (was `429` in v0). |
 | `HERMES_STALE_WEBHOOK_THRESHOLD_S` | `300` | Bridge drops EClaw webhook deliveries whose `timestamp` is older than this many seconds; mitigates startup-flood-of-stale-messages re-triggering the same wedge. |
 
