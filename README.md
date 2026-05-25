@@ -88,6 +88,7 @@ Once running, anyone who messages the bot (via EClaw app or `https://eclawbot.co
 | `scripts/setup-tunnel.sh` | Create Cloudflare named tunnel + DNS CNAME via API |
 | `scripts/bind-entity.sh` | EClaw `/register` + `/bind` (saves botSecret to Keychain) |
 | `scripts/up-bridge.sh` | **Recommended** — run bridge as its own container with `restart: unless-stopped` |
+| `scripts/hermes-healthcheck-cron.py` | H2 operational probe: daemon `/health`, git push dry-run, SLA event log, commander alert after repeated failures |
 | `scripts/start-bridge.sh` | _(legacy)_ run bridge inside openclaw-project-b — dies on container restart |
 | `scripts/teardown.sh` | Reverse: kill bridge, unbind, delete tunnel + DNS |
 | `KNOW-HOW.md` | **All the pitfalls we hit** — read this first |
@@ -110,6 +111,20 @@ Once running, anyone who messages the bot (via EClaw app or `https://eclawbot.co
 1. **No HMAC signing** — gateway runs in `INSECURE_NO_AUTH` mode. Bearer token check is in the bridge itself.
 2. **Serialised replies inside daemon** — the persistent `hermes --continue` child is single-threaded by Hermes design, so the daemon serialises concurrent `POST /chat` requests via an internal queue. EClaw delivery is async, so callers don't block; replies are streamed back over SSE in the order requests were enqueued.
 3. **Keychain is host-only** — for CI/prod need to switch to env file or a secret manager.
+
+## H2 operational health-check
+
+`scripts/hermes-healthcheck-cron.py` is intended to run every 6 hours from the
+`hermes-healthcheck` compose service. It:
+
+- fetches the daemon `/health` endpoint;
+- runs a git push probe against `HERMES_HEALTH_REPO_URL` (`--dry-run` by default);
+- appends probe events to `~/.hermes/eclaw-healthcheck-events.jsonl` for SLA rollups;
+- tracks consecutive failures and rolling weekly uptime SLA in `~/.hermes/eclaw-healthcheck-state.json`;
+- alerts `HERMES_HEALTH_COMMANDER_TARGET` through `/api/transform` after 3 failures.
+
+Real remote writes are opt-in via `HERMES_HEALTH_PUSH_MODE=write`; keep the
+default dry-run mode unless a dedicated health-check branch/repo is approved.
 
 > **Historical (resolved by daemon refactor 2026-04-28):**
 > - ~~Cold start ~7-9s per message~~ — daemon's persistent child pays this once at boot. Per-message latency now ≈ Hermes inference time only. Subprocess fallback still cold-starts when daemon is unreachable, but it now shares the H1 worker safeguards.

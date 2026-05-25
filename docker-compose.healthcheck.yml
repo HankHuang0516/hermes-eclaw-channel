@@ -1,0 +1,42 @@
+# Compose fragment for the openclaw-docker root compose project.
+# Merge it with the root compose file so the relative paths below resolve from
+# that root, for example:
+# docker compose -f docker-compose.yml -f hermes-eclaw-channel/docker-compose.healthcheck.yml up -d hermes-healthcheck
+
+services:
+  hermes-healthcheck:
+    image: hermes-daemon:latest
+    container_name: hermes-healthcheck
+    restart: unless-stopped
+    init: true
+    network_mode: "service:openclaw-b"
+    depends_on:
+      - hermes-daemon
+    volumes:
+      - ./project-b/hermes-agent:/home/node/hermes-agent
+      - ./project-b/hermes-home:/home/node/.hermes
+      - ./project-b/uv-local:/home/node/.local
+      - ./hermes-eclaw-channel:/app:ro
+    working_dir: /home/node/hermes-agent
+    environment:
+      HERMES_HEALTH_INTERVAL_SECS: "${HERMES_HEALTH_INTERVAL_SECS:-21600}"
+      HERMES_HEALTH_DAEMON_URL: "${HERMES_HEALTH_DAEMON_URL:-http://127.0.0.1:8645/health}"
+      HERMES_HEALTH_ALERT_AFTER_FAILURES: "${HERMES_HEALTH_ALERT_AFTER_FAILURES:-3}"
+      HERMES_HEALTH_BRANCH: "${HERMES_HEALTH_BRANCH:-hermes-healthcheck}"
+      HERMES_HEALTH_PUSH_MODE: "${HERMES_HEALTH_PUSH_MODE:-dry-run}"
+      HERMES_HEALTH_REPO_URL: "${HERMES_HEALTH_REPO_URL:-https://github.com/HankHuang0516/EClaw.git}"
+      HERMES_HEALTH_COMMANDER_TARGET: "${HERMES_HEALTH_COMMANDER_TARGET:-2}"
+      HERMES_GH_PAT: "${HERMES_GH_PAT}"
+      HERMES_ECLAW_API_BASE: "${HERMES_ECLAW_API_BASE}"
+      HERMES_ECLAW_DEVICE_ID: "${HERMES_ECLAW_DEVICE_ID}"
+      HERMES_ECLAW_ENTITY_ID: "${HERMES_ECLAW_ENTITY_ID}"
+      HERMES_ECLAW_BOT_SECRET: "${HERMES_ECLAW_BOT_SECRET:-}"
+    entrypoint: []
+    command:
+      - /bin/sh
+      - -lc
+      - |
+        while true; do
+          /usr/bin/python3 /app/scripts/hermes-healthcheck-cron.py || true
+          sleep "$${HERMES_HEALTH_INTERVAL_SECS:-21600}"
+        done
