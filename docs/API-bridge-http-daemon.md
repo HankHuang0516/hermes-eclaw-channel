@@ -254,6 +254,28 @@ sensible defaults match the v0 contract.
 | `HERMES_ECLAW_API_BACKOFF_BASE_S` | `1` | First EClaw delivery retry delay; later retries double up to the max. |
 | `HERMES_ECLAW_API_BACKOFF_MAX_S` | `30` | Cap for EClaw delivery exponential backoff and `Retry-After` waits. |
 
+## 8c. Phase H2 health-check cron
+
+`scripts/hermes-healthcheck-cron.py` is the first Operational Maturity probe:
+run it every 6h from cron or the `hermes-healthcheck` compose service. It
+checks daemon `/health`, runs a git push probe, records JSONL probe events for
+SLA rollups, and alerts the commander after repeated failures.
+
+| Var | Default | Purpose |
+|-----|---------|---------|
+| `HERMES_HEALTH_INTERVAL_SECS` | `21600` | Compose loop sleep; 6h target. |
+| `HERMES_HEALTH_DAEMON_URL` | `http://127.0.0.1:8645/health` | Daemon endpoint to probe. |
+| `HERMES_HEALTH_DAEMON_TIMEOUT_S` | `10` | Daemon probe HTTP timeout. |
+| `HERMES_HEALTH_REPO_URL` | `HERMES_PR_REPO_URL` or EClaw repo URL | Remote used for git push probe. |
+| `HERMES_HEALTH_BRANCH` | `hermes-healthcheck` | Dedicated probe branch. |
+| `HERMES_HEALTH_PUSH_MODE` | `dry-run` | `dry-run` verifies auth/push path without writes; `write` pushes the probe commit. |
+| `HERMES_HEALTH_ALERT_AFTER_FAILURES` | `3` | Consecutive failures before commander alert. |
+| `HERMES_HEALTH_COMMANDER_TARGET` | `2` | EClaw `speakTo` target for alerts. |
+| `HERMES_HEALTH_STATE_FILE` | `~/.hermes/eclaw-healthcheck-state.json` | Persistent failure streak state. |
+| `HERMES_HEALTH_EVENTS_FILE` | `~/.hermes/eclaw-healthcheck-events.jsonl` | Append-only SLA probe event log. |
+| `HERMES_HEALTH_SLA_WINDOW_SECS` | `604800` | Rolling SLA window for state-file uptime summary. |
+| `HERMES_HEALTH_SLA_TARGET_PCT` | `99.0` | Target uptime percentage for `state.sla.within_sla`. |
+
 ## 9. Open questions for review
 
 - **Worker concurrency.** v0 = 1 worker, lock-serialised. If we bump that, we
