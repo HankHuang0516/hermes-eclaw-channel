@@ -61,6 +61,10 @@ PORT = int(os.environ.get("HERMES_PORT", "8644"))
 DAEMON_URL = os.environ.get("HERMES_DAEMON_URL", "").rstrip("/")
 DAEMON_TOKEN = os.environ.get("HERMES_DAEMON_TOKEN", "")
 DAEMON_CONNECT_TIMEOUT = float(os.environ.get("HERMES_DAEMON_CONNECT_TIMEOUT", "5"))
+DAEMON_BUSY_RETRIES = int(os.environ.get("HERMES_DAEMON_BUSY_RETRIES", "3"))
+DAEMON_BUSY_BACKOFF_BASE = float(os.environ.get("HERMES_DAEMON_BUSY_BACKOFF_BASE", "1.0"))
+DAEMON_BUSY_BACKOFF_MAX = float(os.environ.get("HERMES_DAEMON_BUSY_BACKOFF_MAX", "8.0"))
+HERMES_ECLAW_RATE_LIMIT_PER_MIN = int(os.environ.get("HERMES_ECLAW_RATE_LIMIT_PER_MIN", "30"))
 
 # Drop webhook deliveries timestamped older than this many seconds. EClaw
 # retries failed webhooks; on bridge restart, the in-flight backlog can land
@@ -80,6 +84,28 @@ PREFER_TRANSFORM_VIA_CHANNEL_KEY = (
 # Kept as a safety net — if Hermes still happens to output this exact token
 # (e.g. from system prompt or memory), skip the reply.
 SILENT_TOKEN = "[SILENT]"
+MODEL_HEALTH_RE = re.compile(r"^MODEL_HEALTHCHECK\s+([A-Za-z0-9_-]+)(?=\s|$)", re.MULTILINE)
+
+_hermes_rate_lock = asyncio.Lock()
+_next_hermes_start = 0.0
+
+
+def build_model_health_prompt(text: str, entity_id: int) -> str | None:
+    """Return a minimal model-backed health prompt when the monitor asks for one.
+
+    The normal EClaw prompt/routing policy stack is intentionally skipped for
+    this probe: those policies are useful for real work, but they can make
+    Hermes answer "acknowledged" instead of the nonce-bearing health line.
+    This still goes through Hermes; it is not a synthetic bridge ACK.
+    """
+    match = MODEL_HEALTH_RE.search(text or "")
+    if not match:
+        return None
+    nonce = match.group(1)
+    return "\n".join([
+        "Reply with exactly this one line and no other text:",
+        f"MODEL_HEALTH {nonce} entity=#{entity_id}",
+    ])
 
 
 def apply_prompt_policy(prompt: str, compiled_prompt: str) -> str:
@@ -364,6 +390,32 @@ class _DaemonUnavailable(Exception):
     """Daemon couldn't be reached — caller should fall back to subprocess."""
 
 
+def _busy_backoff_delay(attempt: int) -> float:
+    """Exponential backoff for daemon busy responses.
+
+    `attempt` is zero-based for the first retry delay. Defaults yield
+    1s, 2s, 4s and cap at 8s.
+    """
+    return min(DAEMON_BUSY_BACKOFF_MAX, DAEMON_BUSY_BACKOFF_BASE * (2 ** attempt))
+
+
+async def _wait_for_hermes_rate_limit() -> None:
+    """Pace outbound Hermes calls so EClaw cannot exceed the channel budget."""
+    global _next_hermes_start
+    if HERMES_ECLAW_RATE_LIMIT_PER_MIN <= 0:
+        return
+
+    interval_s = 60.0 / HERMES_ECLAW_RATE_LIMIT_PER_MIN
+    async with _hermes_rate_lock:
+        now = time.monotonic()
+        delay = max(0.0, _next_hermes_start - now)
+        if delay > 0:
+            log.warning("[hermes] rate-limit backoff %.2fs before next call", delay)
+            await asyncio.sleep(delay)
+            now = _next_hermes_start
+        _next_hermes_start = max(now, _next_hermes_start) + interval_s
+
+
 async def _ask_hermes_via_daemon(prompt: str) -> str:
     """POST /chat to the daemon (JSON mode for now — bridge buffers anyway).
 
@@ -383,18 +435,50 @@ async def _ask_hermes_via_daemon(prompt: str) -> str:
     timeout = ClientTimeout(connect=DAEMON_CONNECT_TIMEOUT, total=None)
     try:
         async with ClientSession(timeout=timeout) as s:
-            async with s.post(url, json=payload, headers=headers) as r:
-                if r.status in (502, 503):
-                    detail = await r.text()
-                    log.warning("[hermes] daemon transport error %d: %s", r.status, detail[:200])
-                    raise _DaemonUnavailable(f"http {r.status}")
-                data = await r.json()
+            for attempt in range(max(0, DAEMON_BUSY_RETRIES) + 1):
+                async with s.post(url, json=payload, headers=headers) as r:
+                    try:
+                        data = await r.json(content_type=None)
+                    except Exception:
+                        data = None
+
+                    if r.status >= 400:
+                        err = (data or {}).get("error", {}) if isinstance(data, dict) else {}
+                        kind = err.get("kind", "")
+                        if kind == "busy":
+                            if attempt < max(0, DAEMON_BUSY_RETRIES):
+                                delay = _busy_backoff_delay(attempt)
+                                log.warning(
+                                    "[hermes] daemon busy attempt %d/%d; backing off %.2fs",
+                                    attempt + 1, DAEMON_BUSY_RETRIES + 1, delay,
+                                )
+                                await asyncio.sleep(delay)
+                                continue
+                            log.warning("[hermes] daemon busy after retries; not falling back to subprocess")
+                            return "[Hermes 忙碌中 — 請稍後重試]"
+
+                        detail = json.dumps(data, ensure_ascii=False)[:200] if data is not None else await r.text()
+                        if kind == "timeout":
+                            log.warning("[hermes] daemon timeout %d: %s", r.status, detail[:200])
+                            return "[Hermes 回應超時]"
+                        if kind == "hermes_exit":
+                            log.warning("[hermes] daemon worker exited %d: %s", r.status, detail[:200])
+                            return "[Hermes 回覆失敗 — 請查 log]"
+                        log.warning("[hermes] daemon transport error %d: %s", r.status, detail[:200])
+                        if kind == "spawn_failed" or r.status in (502, 503):
+                            raise _DaemonUnavailable(f"http {r.status}")
+                        return "[Hermes 回覆失敗 — 請查 log]"
+                    break
     except ClientConnectorError as e:
         log.warning("[hermes] daemon connect failed: %s", e)
         raise _DaemonUnavailable(str(e)) from e
     except asyncio.TimeoutError as e:
         log.warning("[hermes] daemon connect timeout")
         raise _DaemonUnavailable("connect timeout") from e
+
+    if data is None:
+        log.warning("[hermes] daemon returned non-json response")
+        raise _DaemonUnavailable("non-json daemon response")
 
     if not data.get("ok"):
         err = data.get("error", {})
@@ -403,7 +487,10 @@ async def _ask_hermes_via_daemon(prompt: str) -> str:
             return "[Hermes 回應超時]"
         if kind == "hermes_exit":
             return "[Hermes 回覆失敗 — 請查 log]"
-        # spawn_failed / busy: degrade to subprocess
+        if kind == "busy":
+            return "[Hermes 忙碌中 — 請稍後重試]"
+        # spawn_failed and unknown daemon errors: degrade to subprocess.
+        # busy is handled above with backoff so overload doesn't fan out.
         log.warning("[hermes] daemon error %s, falling back: %s", kind, err.get("detail"))
         raise _DaemonUnavailable(kind)
 
@@ -418,6 +505,7 @@ async def ask_hermes(prompt: str) -> str:
     Daemon disabled by default; set HERMES_DAEMON_URL to opt in. Connection-level
     failures fall back to subprocess so a daemon outage degrades gracefully.
     """
+    await _wait_for_hermes_rate_limit()
     if DAEMON_URL:
         try:
             return await _ask_hermes_via_daemon(prompt)
@@ -496,13 +584,24 @@ async def process_message(msg: dict) -> None:
         log.info("ignore message for entity %s (we are %d)", entity_id, ENTITY_ID)
         return
 
+    direct_ack = re.match(r"^ECLAW_HEALTHCHECK\s+([A-Za-z0-9_-]+)(?=\s|$)", text, re.MULTILINE)
+    if direct_ack:
+        ack_text = f"ACK {direct_ack.group(1)}"
+        # /api/client/speak can write its Received echo after webhook dispatch.
+        # Delay the synthetic ACK slightly so monitors see the final bot state
+        # without consuming a Hermes model turn.
+        await asyncio.sleep(3.0)
+        async with ClientSession() as s:
+            await send_message(s, ack_text)
+        return
+
     # Build prompt — enrich bot-to-bot/broadcast with sender context so Hermes
     # knows who's talking. We intentionally do NOT inject EClaw's
     # "output [SILENT] if nothing worth replying" quota instruction: Hermes
     # is too willing to comply and nearly every broadcast came back silent,
     # which looked like the bridge was stuck. Reply on every inbound; if
     # noise becomes an issue, filter at the sender side.
-    prompt = text
+    prompt = build_model_health_prompt(text, ENTITY_ID) or text
     if event in ("entity_message", "broadcast") and from_entity_id is not None:
         # Do NOT prepend missionHints: the server already embeds them inside
         # `text` (via materializeChannelText). Prepending again put
@@ -514,12 +613,13 @@ async def process_message(msg: dict) -> None:
         prefix = "Broadcast from" if event == "broadcast" else "Bot-to-Bot from"
         prompt = f"[{prefix} {sender}]\n{text}" if text else f"[{prefix} {sender}]"
 
-    async with ClientSession() as s:
-        compiled_policy = await fetch_prompt_policy(s)
-        routing_policy = await fetch_routing_policy(s)
+    if not MODEL_HEALTH_RE.search(text):
+        async with ClientSession() as s:
+            compiled_policy = await fetch_prompt_policy(s)
+            routing_policy = await fetch_routing_policy(s)
 
-    prompt = apply_prompt_policy(prompt, compiled_policy)
-    prompt = apply_routing_policy(prompt, routing_policy)
+        prompt = apply_prompt_policy(prompt, compiled_policy)
+        prompt = apply_routing_policy(prompt, routing_policy)
 
     log.info("event=%s from=%s text=%r", event, from_entity_id or "user", text[:80])
     reply = await ask_hermes(prompt)
