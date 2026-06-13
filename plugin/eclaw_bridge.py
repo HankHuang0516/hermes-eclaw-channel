@@ -32,6 +32,7 @@ import json
 import logging
 import os
 import re
+import sys
 import textwrap
 import time
 import uuid
@@ -583,6 +584,22 @@ async def process_message(msg: dict) -> None:
     if entity_id != ENTITY_ID:
         log.info("ignore message for entity %s (we are %d)", entity_id, ENTITY_ID)
         return
+
+    # Universal self-repair directive. Intercept BEFORE any model/Hermes path:
+    # ack best-effort, then sys.exit(0). docker-compose `restart: unless-stopped`
+    # relaunches the bridge, which re-binds on startup and passive-health
+    # re-checks. Mirrors the ECLAW_HEALTHCHECK control-directive style below.
+    self_repair = re.match(r"^\s*ECLAW_SELF_REPAIR\s+([A-Za-z0-9_-]+)", text)
+    if self_repair:
+        nonce = self_repair.group(1)
+        log.info("[self-repair] directive received nonce=%s; restarting", nonce)
+        try:
+            async with ClientSession() as s:
+                await send_message(s, f"ACK {nonce} self-repair: restarting")
+        except Exception:
+            pass  # best-effort ACK
+        await asyncio.sleep(0.5)
+        sys.exit(0)  # Docker restart: unless-stopped relaunches the bridge; passive-health re-checks
 
     direct_ack = re.match(r"^ECLAW_HEALTHCHECK\s+([A-Za-z0-9_-]+)(?=\s|$)", text, re.MULTILINE)
     if direct_ack:
