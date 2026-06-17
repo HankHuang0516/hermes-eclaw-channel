@@ -28,6 +28,8 @@ Auth：EClaw 會帶 Authorization: Bearer <callback_token>。bridge 驗 token �
 from __future__ import annotations
 
 import asyncio
+from collections import deque
+from email.utils import parsedate_to_datetime
 import json
 import logging
 import os
@@ -36,7 +38,7 @@ import sys
 import textwrap
 import time
 import uuid
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from aiohttp import ClientConnectorError, ClientSession, ClientTimeout, web
 
@@ -62,10 +64,17 @@ PORT = int(os.environ.get("HERMES_PORT", "8644"))
 DAEMON_URL = os.environ.get("HERMES_DAEMON_URL", "").rstrip("/")
 DAEMON_TOKEN = os.environ.get("HERMES_DAEMON_TOKEN", "")
 DAEMON_CONNECT_TIMEOUT = float(os.environ.get("HERMES_DAEMON_CONNECT_TIMEOUT", "5"))
-DAEMON_BUSY_RETRIES = int(os.environ.get("HERMES_DAEMON_BUSY_RETRIES", "3"))
-DAEMON_BUSY_BACKOFF_BASE = float(os.environ.get("HERMES_DAEMON_BUSY_BACKOFF_BASE", "1.0"))
-DAEMON_BUSY_BACKOFF_MAX = float(os.environ.get("HERMES_DAEMON_BUSY_BACKOFF_MAX", "8.0"))
-HERMES_ECLAW_RATE_LIMIT_PER_MIN = int(os.environ.get("HERMES_ECLAW_RATE_LIMIT_PER_MIN", "30"))
+DAEMON_BUSY_RETRIES = max(0, int(os.environ.get("HERMES_DAEMON_BUSY_RETRIES", "3")))
+DAEMON_BUSY_BACKOFF_BASE_S = float(os.environ.get("HERMES_DAEMON_BUSY_BACKOFF_BASE_S", "1"))
+DAEMON_BUSY_BACKOFF_MAX_S = float(os.environ.get("HERMES_DAEMON_BUSY_BACKOFF_MAX_S", "10"))
+
+# EClaw message endpoints enforce 30 req/min for channel/entity delivery.
+# Keep the bridge below that limit locally, and retry explicit back-pressure
+# responses instead of dropping replies during bursts.
+ECLAW_API_RATE_LIMIT_PER_MIN = max(0, int(os.environ.get("HERMES_ECLAW_API_RATE_LIMIT_PER_MIN", "30")))
+ECLAW_API_BACKOFF_RETRIES = max(0, int(os.environ.get("HERMES_ECLAW_API_BACKOFF_RETRIES", "3")))
+ECLAW_API_BACKOFF_BASE_S = float(os.environ.get("HERMES_ECLAW_API_BACKOFF_BASE_S", "1"))
+ECLAW_API_BACKOFF_MAX_S = float(os.environ.get("HERMES_ECLAW_API_BACKOFF_MAX_S", "30"))
 
 # Drop webhook deliveries timestamped older than this many seconds. EClaw
 # retries failed webhooks; on bridge restart, the in-flight backlog can land
@@ -87,9 +96,6 @@ PREFER_TRANSFORM_VIA_CHANNEL_KEY = (
 SILENT_TOKEN = "[SILENT]"
 MODEL_HEALTH_RE = re.compile(r"^MODEL_HEALTHCHECK\s+([A-Za-z0-9_-]+)(?=\s|$)", re.MULTILINE)
 
-_hermes_rate_lock = asyncio.Lock()
-_next_hermes_start = 0.0
-
 
 def build_model_health_prompt(text: str, entity_id: int) -> str | None:
     """Return a minimal model-backed health prompt when the monitor asks for one.
@@ -107,6 +113,95 @@ def build_model_health_prompt(text: str, entity_id: int) -> str | None:
         "Reply with exactly this one line and no other text:",
         f"MODEL_HEALTH {nonce} entity=#{entity_id}",
     ])
+
+
+async def _sleep(delay_s: float) -> None:
+    await asyncio.sleep(delay_s)
+
+
+class _SlidingWindowRateLimiter:
+    """Async sliding-window limiter for EClaw's per-minute delivery cap."""
+
+    def __init__(
+        self,
+        limit: int,
+        window_s: float = 60.0,
+        *,
+        clock: Callable[[], float] | None = None,
+        sleep: Callable[[float], Awaitable[None]] | None = None,
+    ):
+        self.limit = max(0, limit)
+        self.window_s = window_s
+        self._clock = clock or time.monotonic
+        self._sleep = sleep or _sleep
+        self._events: deque[float] = deque()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        if self.limit <= 0:
+            return
+
+        while True:
+            wait_s = 0.0
+            async with self._lock:
+                now = self._clock()
+                while self._events and now - self._events[0] >= self.window_s:
+                    self._events.popleft()
+
+                if len(self._events) < self.limit:
+                    self._events.append(now)
+                    return
+
+                wait_s = max(0.0, self.window_s - (now - self._events[0]))
+
+            log.warning(
+                "EClaw API rate limit reached (%d/%ds); backing off %.2fs",
+                self.limit, self.window_s, wait_s,
+            )
+            await self._sleep(wait_s)
+
+
+_eclaw_api_rate_limiter = _SlidingWindowRateLimiter(ECLAW_API_RATE_LIMIT_PER_MIN)
+
+
+def _exponential_backoff_delay(
+    attempt: int,
+    *,
+    base_s: float,
+    max_s: float,
+    retry_after_s: float | None = None,
+) -> float:
+    max_s = max(0.0, max_s)
+    if retry_after_s is not None:
+        return min(max(0.0, retry_after_s), max_s)
+    return min(max_s, max(0.0, base_s * (2 ** attempt)))
+
+
+def _parse_retry_after(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    try:
+        retry_at = parsedate_to_datetime(value)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+    if retry_at.tzinfo is None:
+        return None
+    return max(0.0, retry_at.timestamp() - time.time())
+
+
+async def _response_json_or_error(response) -> dict:
+    try:
+        data = await response.json()
+    except Exception:
+        text = await response.text()
+        return {"success": False, "error": text[:500], "status": response.status}
+    if isinstance(data, dict):
+        return data
+    return {"success": False, "error": data, "status": response.status}
 
 
 def apply_prompt_policy(prompt: str, compiled_prompt: str) -> str:
@@ -200,11 +295,16 @@ async def send_message(
         if sender_hint:
             body["senderHint"] = sender_hint
         headers = {"X-Channel-Key": API_KEY}
-        async with session.post(f"{API_BASE}/api/transform", json=body, headers=headers) as r:
-            data = await r.json()
-            if not data.get("success"):
-                log.error("send_message via transform failed: %s", data)
-            return data
+        data = await _post_eclaw_json(
+            session,
+            f"{API_BASE}/api/transform",
+            body=body,
+            headers=headers,
+            label="send_message via transform",
+        )
+        if not data.get("success"):
+            log.error("send_message via transform failed: %s", data)
+        return data
     else:
         # Default path: /api/channel/message (Phase 4 fallback)
         body = {
@@ -217,11 +317,49 @@ async def send_message(
         }
         if sender_hint:
             body["senderHint"] = sender_hint
-        async with session.post(f"{API_BASE}/api/channel/message", json=body) as r:
-            data = await r.json()
-            if not data.get("success"):
-                log.error("send_message failed: %s", data)
-            return data
+        data = await _post_eclaw_json(
+            session,
+            f"{API_BASE}/api/channel/message",
+            body=body,
+            label="send_message",
+        )
+        if not data.get("success"):
+            log.error("send_message failed: %s", data)
+        return data
+
+
+async def _post_eclaw_json(
+    session: ClientSession,
+    url: str,
+    *,
+    body: dict,
+    label: str,
+    headers: dict | None = None,
+) -> dict:
+    """POST to EClaw with local 30/min pacing and 429/503 backoff."""
+    attempts = ECLAW_API_BACKOFF_RETRIES + 1
+    for attempt in range(attempts):
+        await _eclaw_api_rate_limiter.acquire()
+        async with session.post(url, json=body, headers=headers) as r:
+            data = await _response_json_or_error(r)
+            if r.status not in (429, 503) or attempt == attempts - 1:
+                return data
+
+            retry_after_s = _parse_retry_after(r.headers.get("Retry-After"))
+            delay_s = _exponential_backoff_delay(
+                attempt,
+                base_s=ECLAW_API_BACKOFF_BASE_S,
+                max_s=ECLAW_API_BACKOFF_MAX_S,
+                retry_after_s=retry_after_s,
+            )
+            log.warning(
+                "%s back-pressure http %d (attempt %d/%d); retrying in %.2fs",
+                label, r.status, attempt + 1, attempts, delay_s,
+            )
+
+        await _sleep(delay_s)
+
+    return {"success": False, "error": "unreachable retry state"}
 
 
 # Cached once per process — the routing policy is static across messages and
@@ -391,38 +529,13 @@ class _DaemonUnavailable(Exception):
     """Daemon couldn't be reached — caller should fall back to subprocess."""
 
 
-def _busy_backoff_delay(attempt: int) -> float:
-    """Exponential backoff for daemon busy responses.
-
-    `attempt` is zero-based for the first retry delay. Defaults yield
-    1s, 2s, 4s and cap at 8s.
-    """
-    return min(DAEMON_BUSY_BACKOFF_MAX, DAEMON_BUSY_BACKOFF_BASE * (2 ** attempt))
-
-
-async def _wait_for_hermes_rate_limit() -> None:
-    """Pace outbound Hermes calls so EClaw cannot exceed the channel budget."""
-    global _next_hermes_start
-    if HERMES_ECLAW_RATE_LIMIT_PER_MIN <= 0:
-        return
-
-    interval_s = 60.0 / HERMES_ECLAW_RATE_LIMIT_PER_MIN
-    async with _hermes_rate_lock:
-        now = time.monotonic()
-        delay = max(0.0, _next_hermes_start - now)
-        if delay > 0:
-            log.warning("[hermes] rate-limit backoff %.2fs before next call", delay)
-            await asyncio.sleep(delay)
-            now = _next_hermes_start
-        _next_hermes_start = max(now, _next_hermes_start) + interval_s
-
-
 async def _ask_hermes_via_daemon(prompt: str) -> str:
     """POST /chat to the daemon (JSON mode for now — bridge buffers anyway).
 
     Connection-level failures raise _DaemonUnavailable so the caller falls back
     to subprocess. Clean daemon errors (timeout / hermes_exit) become user-facing
-    text; we don't retry in subprocess for those.
+    text; daemon busy is retried with exponential backoff instead of bypassing
+    back-pressure through subprocess fallback.
     """
     url = f"{DAEMON_URL}/chat"
     headers = {"Accept": "application/json"}
@@ -435,41 +548,35 @@ async def _ask_hermes_via_daemon(prompt: str) -> str:
 
     timeout = ClientTimeout(connect=DAEMON_CONNECT_TIMEOUT, total=None)
     try:
+        attempts = DAEMON_BUSY_RETRIES + 1
         async with ClientSession(timeout=timeout) as s:
-            for attempt in range(max(0, DAEMON_BUSY_RETRIES) + 1):
+            for attempt in range(attempts):
                 async with s.post(url, json=payload, headers=headers) as r:
-                    try:
-                        data = await r.json(content_type=None)
-                    except Exception:
-                        data = None
+                    data = await _response_json_or_error(r)
+                    err = data.get("error", {}) if isinstance(data, dict) else {}
+                    kind = err.get("kind") if isinstance(err, dict) else None
 
-                    if r.status >= 400:
-                        err = (data or {}).get("error", {}) if isinstance(data, dict) else {}
-                        kind = err.get("kind", "")
-                        if kind == "busy":
-                            if attempt < max(0, DAEMON_BUSY_RETRIES):
-                                delay = _busy_backoff_delay(attempt)
-                                log.warning(
-                                    "[hermes] daemon busy attempt %d/%d; backing off %.2fs",
-                                    attempt + 1, DAEMON_BUSY_RETRIES + 1, delay,
-                                )
-                                await asyncio.sleep(delay)
-                                continue
-                            log.warning("[hermes] daemon busy after retries; not falling back to subprocess")
-                            return "[Hermes 忙碌中 — 請稍後重試]"
+                    if r.status == 503 and kind == "busy":
+                        if attempt == attempts - 1:
+                            log.warning("[hermes] daemon busy after %d attempts", attempts)
+                            return "[Hermes 忙碌中 — 請稍後再試]"
+                        delay_s = _exponential_backoff_delay(
+                            attempt,
+                            base_s=DAEMON_BUSY_BACKOFF_BASE_S,
+                            max_s=DAEMON_BUSY_BACKOFF_MAX_S,
+                            retry_after_s=_parse_retry_after(r.headers.get("Retry-After")),
+                        )
+                        log.warning(
+                            "[hermes] daemon busy (attempt %d/%d); retrying in %.2fs",
+                            attempt + 1, attempts, delay_s,
+                        )
+                    elif r.status in (502, 503):
+                        log.warning("[hermes] daemon transport error %d: %s", r.status, data)
+                        raise _DaemonUnavailable(f"http {r.status}")
+                    else:
+                        break
 
-                        detail = json.dumps(data, ensure_ascii=False)[:200] if data is not None else await r.text()
-                        if kind == "timeout":
-                            log.warning("[hermes] daemon timeout %d: %s", r.status, detail[:200])
-                            return "[Hermes 回應超時]"
-                        if kind == "hermes_exit":
-                            log.warning("[hermes] daemon worker exited %d: %s", r.status, detail[:200])
-                            return "[Hermes 回覆失敗 — 請查 log]"
-                        log.warning("[hermes] daemon transport error %d: %s", r.status, detail[:200])
-                        if kind == "spawn_failed" or r.status in (502, 503):
-                            raise _DaemonUnavailable(f"http {r.status}")
-                        return "[Hermes 回覆失敗 — 請查 log]"
-                    break
+                await _sleep(delay_s)
     except ClientConnectorError as e:
         log.warning("[hermes] daemon connect failed: %s", e)
         raise _DaemonUnavailable(str(e)) from e
@@ -488,10 +595,7 @@ async def _ask_hermes_via_daemon(prompt: str) -> str:
             return "[Hermes 回應超時]"
         if kind == "hermes_exit":
             return "[Hermes 回覆失敗 — 請查 log]"
-        if kind == "busy":
-            return "[Hermes 忙碌中 — 請稍後重試]"
-        # spawn_failed and unknown daemon errors: degrade to subprocess.
-        # busy is handled above with backoff so overload doesn't fan out.
+        # spawn_failed and other non-back-pressure failures degrade to subprocess.
         log.warning("[hermes] daemon error %s, falling back: %s", kind, err.get("detail"))
         raise _DaemonUnavailable(kind)
 
@@ -506,7 +610,6 @@ async def ask_hermes(prompt: str) -> str:
     Daemon disabled by default; set HERMES_DAEMON_URL to opt in. Connection-level
     failures fall back to subprocess so a daemon outage degrades gracefully.
     """
-    await _wait_for_hermes_rate_limit()
     if DAEMON_URL:
         try:
             return await _ask_hermes_via_daemon(prompt)

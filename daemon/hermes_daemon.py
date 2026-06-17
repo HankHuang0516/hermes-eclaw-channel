@@ -21,7 +21,9 @@ from aiohttp import web
 
 from . import hermes_worker
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+from .log_json import configure_json_logging
+
+configure_json_logging(logging.INFO)
 log = logging.getLogger("hermes-daemon")
 
 VERSION = "0.1.0"
