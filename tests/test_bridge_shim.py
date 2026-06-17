@@ -73,6 +73,21 @@ async def test_daemon_up_returns_reply(monkeypatch):
         await server.close()
 
 
+def test_model_health_prompt_is_minimal(monkeypatch):
+    _ensure_bridge_env()
+    bridge = _reload_bridge()
+
+    prompt = bridge.build_model_health_prompt(
+        "MODEL_HEALTHCHECK MH5abc123\nDo not run tools.\nMODEL_HEALTH MH5abc123 entity=#5",
+        5,
+    )
+
+    assert prompt == (
+        "Reply with exactly this one line and no other text:\n"
+        "MODEL_HEALTH MH5abc123 entity=#5"
+    )
+
+
 async def test_daemon_down_falls_back(monkeypatch):
     _ensure_bridge_env()
     # 9 is the discard port; connection refused fast.
