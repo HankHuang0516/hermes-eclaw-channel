@@ -695,6 +695,40 @@ def _write_agent_creds() -> None:
         log.info("wrote agent creds file: %s (entity=%d)", path, ENTITY_ID)
     except Exception as exc:  # never block boot on creds-write
         log.warning("failed to write agent creds file %s: %s", path, exc)
+    _write_railway_token()
+
+
+def _write_railway_token() -> None:
+    """Provision the Railway project token to the agent workspace (card_861a6a10).
+
+    The Railway prod-log monitor needs RAILWAY_ECLAE_0617 (a Railway project
+    token) to POST backboard.railway.app. The token lives in the EClaw vault,
+    not in this container's env. The bridge already holds deviceId+botSecret +
+    has egress, so fetch the vault var and drop it as a 0600 file in the shared
+    workspace; the agent reads from disk (never in prompt/chat). Best-effort.
+    """
+    import json
+    import urllib.request
+    home = os.environ.get("HERMES_AGENT_HOME", "/home/node/hermes-agent")
+    out = os.path.join(home, ".railway-token")
+    key = os.environ.get("HERMES_RAILWAY_VAULT_KEY", "RAILWAY_ECLAE_0617")
+    try:
+        url = f"{API_BASE}/api/device-vars?deviceId={DEVICE_ID}&botSecret={BOT_SECRET}"
+        req = urllib.request.Request(url, headers={"User-Agent": "hermes-bridge/creds"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+        v = data.get("vars", {}) if isinstance(data, dict) else {}
+        tok = v.get(key, "") if isinstance(v, dict) else ""
+        if not tok:
+            log.warning("railway token: vault key %s empty; skip", key)
+            return
+        fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(tok)
+        os.chmod(out, 0o600)
+        log.info("wrote railway token file: %s (vault key=%s, len=%d)", out, key, len(tok))
+    except Exception as exc:  # never block boot
+        log.warning("failed to write railway token file %s: %s", out, exc)
 
 
 if __name__ == "__main__":
