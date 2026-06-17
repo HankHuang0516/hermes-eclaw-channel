@@ -667,6 +667,37 @@ def make_app() -> web.Application:
     return app
 
 
+def _write_agent_creds() -> None:
+    """Surface this entity's EClaw creds to the agent workspace out-of-band.
+
+    The agent (hermes child) shares the ./project-b/hermes-agent bind-mount
+    with this bridge but never sees the [AVAILABLE TOOLS] block (it's stripped
+    by _strip_eclaw_context for #142, and the policy text would re-trigger the
+    file-edit classifier). Without creds the agent can't call /api/mission/* etc.
+    on its own behalf (card_14314f42). The bridge already holds the creds in env,
+    so write them to a 0600 file in the shared workspace; the agent reads from
+    disk — creds never enter the prompt/chat, so no leak and strip is preserved.
+    """
+    import json
+    path = os.path.join(os.environ.get("HERMES_AGENT_HOME", "/home/node/hermes-agent"), ".eclaw-creds.json")
+    payload = {
+        "deviceId": DEVICE_ID,
+        "entityId": ENTITY_ID,
+        "botSecret": BOT_SECRET,
+        "apiBase": API_BASE,
+        "note": "Auto-written by eclaw_bridge on boot. Use for /api/mission/* and /api/transform as THIS entity. Do NOT echo into chat replies.",
+    }
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            json.dump(payload, fh)
+        os.chmod(path, 0o600)
+        log.info("wrote agent creds file: %s (entity=%d)", path, ENTITY_ID)
+    except Exception as exc:  # never block boot on creds-write
+        log.warning("failed to write agent creds file %s: %s", path, exc)
+
+
 if __name__ == "__main__":
     log.info("starting on :%d (entity=%d, device=%s)", PORT, ENTITY_ID, DEVICE_ID[:8])
+    _write_agent_creds()
     web.run_app(make_app(), host="0.0.0.0", port=PORT, access_log=None)
