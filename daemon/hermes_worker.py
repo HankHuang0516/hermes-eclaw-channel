@@ -9,6 +9,7 @@ behaviour bit-for-bit.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -194,6 +195,48 @@ _BASH_SANDBOX_NOTES = "\n".join([
     "[End Hermes Bash sandbox notes]",
     "",
 ])
+
+
+_identity_cache: Optional[str] = None
+
+
+def identity_preamble() -> str:
+    """One-line baked identity statement prepended to every Hermes prompt.
+
+    Reads the identity fields the bridge writes to ``.eclaw-creds.json`` on boot
+    (card_3dfbce3b) so the agent always KNOWS who it is — entityId / publicCode /
+    displayName — and never has to ask or guess. botSecret is NOT surfaced here
+    (identity is safe to state in chat; the secret is not). Best-effort: returns
+    "" if the creds file is absent/unreadable so prompts still flow.
+    """
+    global _identity_cache
+    if _identity_cache is not None:
+        return _identity_cache
+    try:
+        path = os.path.join(HERMES_CWD, ".eclaw-creds.json")
+        with open(path, "r") as fh:
+            c = json.load(fh)
+        eid = c.get("entityId", "")
+        pc = c.get("publicCode", "")
+        name = c.get("displayName", "") or c.get("character", "")
+        bits = [f"entityId={eid}"]
+        if name:
+            bits.append(f"name={name}")
+        if pc:
+            bits.append(f"publicCode={pc}")
+        line = ", ".join(bits)
+        _identity_cache = "\n".join([
+            "[Your EClaw identity]",
+            f"You are EClaw entity {eid}" + (f' ("{name}")' if name else "") + ".",
+            f"Your identity: {line}.",
+            "When asked who you are / your entity id / your public code, answer from this directly — do not say you don't know.",
+            "(Full creds incl. botSecret are in .eclaw-creds.json for API calls; never echo the secret into chat.)",
+            "[End EClaw identity]",
+            "",
+        ])
+    except Exception:  # never block a prompt on identity read
+        _identity_cache = ""
+    return _identity_cache
 
 
 def extract_hermes_reply(stdout: str) -> str:
@@ -547,7 +590,7 @@ async def _run_chat_subprocess(prompt: str, timeout: Optional[int] = None, *, cw
     # the same prompt-cleaning pipeline as user content (escape doubles `[` so
     # rich.console doesn't crash; strip is harmless here since the notes don't
     # match any policy block patterns).
-    clean = strip_eclaw_context(_BASH_SANDBOX_NOTES + prompt)
+    clean = strip_eclaw_context(identity_preamble() + _BASH_SANDBOX_NOTES + prompt)
     safe = escape_rich_brackets(clean)
     wall_deadline = timeout if timeout is not None else DEFAULT_TIMEOUT
     if use_continue is None:

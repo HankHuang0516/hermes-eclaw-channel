@@ -667,6 +667,35 @@ def make_app() -> web.Application:
     return app
 
 
+def _fetch_self_identity() -> dict:
+    """Look up THIS entity's name/publicCode/character from /api/entities.
+
+    The bridge only holds entityId+deviceId+botSecret in env; publicCode and
+    displayName live server-side. Fetch the device's entity list and pick the
+    row matching ENTITY_ID. Best-effort: returns {} on any failure so boot is
+    never blocked (card_3dfbce3b).
+    """
+    import json
+    import urllib.request
+    try:
+        url = f"{API_BASE}/api/entities?deviceId={DEVICE_ID}&botSecret={BOT_SECRET}"
+        req = urllib.request.Request(url, headers={"User-Agent": "hermes-bridge/identity"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+        ents = data.get("entities", []) if isinstance(data, dict) else []
+        for e in ents:
+            if isinstance(e, dict) and e.get("entityId") == ENTITY_ID:
+                return {
+                    "name": e.get("name", ""),
+                    "publicCode": e.get("publicCode", ""),
+                    "character": e.get("character", ""),
+                }
+        log.warning("identity: entity %d not found in /api/entities", ENTITY_ID)
+    except Exception as exc:  # never block boot on identity lookup
+        log.warning("failed to fetch self identity: %s", exc)
+    return {}
+
+
 def _write_agent_creds() -> None:
     """Surface this entity's EClaw creds to the agent workspace out-of-band.
 
@@ -680,12 +709,20 @@ def _write_agent_creds() -> None:
     """
     import json
     path = os.path.join(os.environ.get("HERMES_AGENT_HOME", "/home/node/hermes-agent"), ".eclaw-creds.json")
+    ident = _fetch_self_identity()
     payload = {
         "deviceId": DEVICE_ID,
         "entityId": ENTITY_ID,
         "botSecret": BOT_SECRET,
         "apiBase": API_BASE,
-        "note": "Auto-written by eclaw_bridge on boot. Use for /api/mission/* and /api/transform as THIS entity. Do NOT echo into chat replies.",
+        # Identity fields (card_3dfbce3b): so the agent knows WHO it is without
+        # asking. publicCode is the routing handle; displayName/character are
+        # the human-facing name. Fetched from /api/entities on boot; falls back
+        # to entityId-only if the lookup fails (never blocks boot).
+        "publicCode": ident.get("publicCode", ""),
+        "displayName": ident.get("name", ""),
+        "character": ident.get("character", ""),
+        "note": "Auto-written by eclaw_bridge on boot. Use for /api/mission/* and /api/transform as THIS entity. Do NOT echo creds (botSecret) into chat replies; identity (entityId/publicCode/displayName) is safe to state.",
     }
     try:
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
