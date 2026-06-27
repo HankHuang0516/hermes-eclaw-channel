@@ -91,6 +91,38 @@ PREFER_TRANSFORM_VIA_CHANNEL_KEY = (
     os.environ.get("HERMES_ECLAW_PREFER_TRANSFORM_VIA_CHANNEL_KEY", "").lower() == "true"
 )
 
+# card_35cb55fc — wallpaper activity-state redesign. Forward THIS entity's REAL
+# runtime activity to EClaw's POST /api/entity/heartbeat so the live wallpaper
+# reflects what the agent is actually doing, instead of inferring liveness from
+# lastSendAt alone. The backend trusts runtimeState only when fresh (≤45s), so
+# the bridge pushes on a short cadence (default 12s). Hermes (non-interactive
+# daemon/subprocess) exposes a clean busy/idle signal — a model turn is in
+# flight or it isn't — but has no interactive confirm-prompt ("stuck") or crash
+# signal the bridge can read, so it only ever emits "busy"/"idle". The backend
+# gracefully degrades to lastSendAt freshness for the other contract values
+# (design: 无探针者优雅降级回 lastSendAt 新鲜度).
+RUNTIME_HEARTBEAT_ENABLED = (
+    os.environ.get("HERMES_RUNTIME_HEARTBEAT_ENABLED", "true").lower() != "false"
+)
+RUNTIME_HEARTBEAT_INTERVAL_S = float(
+    os.environ.get("HERMES_RUNTIME_HEARTBEAT_INTERVAL_S", "12")
+)
+
+# Count of model turns currently in flight. Incremented/decremented around
+# ask_hermes() (works in BOTH daemon and subprocess mode), read by the runtime
+# heartbeat loop. Module-global is fine — one bridge process == one entity.
+_runtime_inflight = 0
+
+
+def runtime_state_from_inflight(inflight: int) -> str:
+    """Map the in-flight model-turn count to the EClaw runtimeState contract.
+
+    Returns "busy" while a Hermes turn is running, "idle" otherwise. Hermes has
+    no bridge-observable "stuck"/"crashed" state, so those contract values are
+    never emitted here (the backend covers them via lastSendAt freshness).
+    """
+    return "busy" if inflight > 0 else "idle"
+
 # Kept as a safety net — if Hermes still happens to output this exact token
 # (e.g. from system prompt or memory), skip the reply.
 SILENT_TOKEN = "[SILENT]"
@@ -609,13 +641,22 @@ async def ask_hermes(prompt: str) -> str:
 
     Daemon disabled by default; set HERMES_DAEMON_URL to opt in. Connection-level
     failures fall back to subprocess so a daemon outage degrades gracefully.
+
+    Wrapped with the runtime in-flight counter (card_35cb55fc) so the runtime
+    heartbeat loop reports "busy" for the duration of a model turn — covers both
+    the daemon and subprocess paths since both flow through here.
     """
-    if DAEMON_URL:
-        try:
-            return await _ask_hermes_via_daemon(prompt)
-        except _DaemonUnavailable:
-            log.warning("[hermes] daemon unreachable, falling back to subprocess")
-    return await _ask_hermes_subprocess(prompt)
+    global _runtime_inflight
+    _runtime_inflight += 1
+    try:
+        if DAEMON_URL:
+            try:
+                return await _ask_hermes_via_daemon(prompt)
+            except _DaemonUnavailable:
+                log.warning("[hermes] daemon unreachable, falling back to subprocess")
+        return await _ask_hermes_subprocess(prompt)
+    finally:
+        _runtime_inflight -= 1
 
 
 async def _ask_hermes_subprocess(prompt: str) -> str:
@@ -763,10 +804,69 @@ async def health(_: web.Request) -> web.Response:
     return web.json_response({"status": "ok", "service": "eclaw-bridge", "entityId": ENTITY_ID})
 
 
+async def _runtime_heartbeat_loop() -> None:
+    """card_35cb55fc: periodically POST this entity's runtimeState to EClaw.
+
+    Best-effort + isolated: every error is swallowed (with throttled logging) so
+    a missing/slow heartbeat endpoint can never disrupt webhook handling. Pushes
+    on RUNTIME_HEARTBEAT_INTERVAL_S cadence (well inside the backend's 45s
+    freshness window); a transition surfaces within one tick.
+    """
+    last_state: str | None = None
+    last_err_log = 0.0
+    timeout = ClientTimeout(total=10)
+    async with ClientSession(timeout=timeout) as session:
+        while True:
+            await asyncio.sleep(RUNTIME_HEARTBEAT_INTERVAL_S)
+            runtime_state = runtime_state_from_inflight(_runtime_inflight)
+            body = {
+                "deviceId": DEVICE_ID,
+                "entityId": ENTITY_ID,
+                "botSecret": BOT_SECRET,
+                "runtimeState": runtime_state,
+            }
+            try:
+                async with session.post(f"{API_BASE}/api/entity/heartbeat", json=body) as r:
+                    if r.status < 400:
+                        if runtime_state != last_state:
+                            log.info("runtime heartbeat: %s -> %s", last_state or "(none)", runtime_state)
+                            last_state = runtime_state
+                    else:
+                        now = time.time()
+                        if now - last_err_log > 300:
+                            last_err_log = now
+                            log.warning("runtime heartbeat POST failed: HTTP %d (throttled, next log >=5min)", r.status)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # never let a heartbeat error escape
+                now = time.time()
+                if now - last_err_log > 300:
+                    last_err_log = now
+                    log.warning("runtime heartbeat error: %s (throttled, next log >=5min)", exc)
+
+
+async def _start_runtime_heartbeat(app: web.Application) -> None:
+    app["runtime_heartbeat_task"] = asyncio.create_task(_runtime_heartbeat_loop())
+    log.info("runtime-state heartbeat enabled: every %ss", RUNTIME_HEARTBEAT_INTERVAL_S)
+
+
+async def _stop_runtime_heartbeat(app: web.Application) -> None:
+    task = app.get("runtime_heartbeat_task")
+    if task is not None:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
 def make_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/health", health)
     app.router.add_post("/webhooks/eclaw", handle_webhook)
+    if RUNTIME_HEARTBEAT_ENABLED:
+        app.on_startup.append(_start_runtime_heartbeat)
+        app.on_cleanup.append(_stop_runtime_heartbeat)
     return app
 
 
